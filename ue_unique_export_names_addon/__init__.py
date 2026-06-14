@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UE Unique Export Names",
     "author": "Codex",
-    "version": (2, 0, 0),
+    "version": (2, 1, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > UE Names",
     "description": "Rename Blender materials/textures for Send to Unreal and write an Unreal postprocess manifest.",
@@ -20,6 +20,7 @@ from bpy.props import BoolProperty, EnumProperty, StringProperty
 BACKUP_PROP = "_ue_unique_export_original_name"
 BACKUP_FILEPATH_PROP = "_ue_unique_export_original_filepath"
 BACKUP_FILEPATH_RAW_PROP = "_ue_unique_export_original_filepath_raw"
+UNREAL_PIPELINE_EXPORT_DIR = Path(r"C:/Users/PARK/Documents/UE_Blender_Pipeline/exports")
 
 ROLE_BY_BSDF_INPUT = {
     "Base Color": "BaseColor",
@@ -373,6 +374,46 @@ def write_manifest(context, prefix, objects, materials, texture_map, export_dir)
     return manifest_path
 
 
+def first_slot_index_for_material(objects, material):
+    for obj in objects:
+        for slot_index, slot in enumerate(obj.material_slots):
+            if slot.material == material:
+                return slot_index
+    return 0
+
+
+def write_unreal_pipeline_json(context, prefix, objects, materials, texture_map):
+    data = {
+        "mesh_name": prefix,
+        "materials": [],
+    }
+
+    for mat in materials:
+        textures = []
+        for role, image in texture_map.get(mat, {}).items():
+            textures.append(
+                {
+                    "param": role,
+                    "asset_name": image.name,
+                    "file": bpy.path.abspath(image.filepath_raw or image.filepath).replace("\\", "/"),
+                }
+            )
+
+        data["materials"].append(
+            {
+                "name": mat.name,
+                "slot_index": first_slot_index_for_material(objects, mat),
+                "textures": textures,
+            }
+        )
+
+    UNREAL_PIPELINE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = UNREAL_PIPELINE_EXPORT_DIR / f"{prefix}.json"
+    json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    context.scene.ue_unique_names.last_pipeline_json_path = str(json_path)
+    return json_path
+
+
 class UEUN_OT_prepare_names(bpy.types.Operator):
     bl_idname = "ue_unique_names.prepare"
     bl_label = "Prepare Unique Names"
@@ -426,13 +467,16 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
                 image.filepath_raw = image.filepath
 
         manifest_path = None
+        pipeline_json_path = None
         if props.write_manifest and props.texture_handling == "WRITE_FILES":
             manifest_path = write_manifest(context, prefix, objects, materials, texture_map, export_dir)
+            pipeline_json_path = write_unreal_pipeline_json(context, prefix, objects, materials, texture_map)
 
         self.report(
             {"INFO"},
             f"Prepared {len(materials)} materials, {len(images)} textures, wrote {texture_file_count} files"
             + (f", manifest: {manifest_path.name}" if manifest_path else "")
+            + (f", JSON: {pipeline_json_path.name}" if pipeline_json_path else "")
             + ". File was not saved.",
         )
         return {"FINISHED"}
@@ -494,6 +538,7 @@ class UEUN_PG_settings(bpy.types.PropertyGroup):
     rename_image_paths: BoolProperty(name="Rename Texture Path Strings", default=True)
     write_manifest: BoolProperty(name="Write Unreal Manifest", default=True)
     last_manifest_path: StringProperty(name="Last Manifest", default="")
+    last_pipeline_json_path: StringProperty(name="Last Pipeline JSON", default="")
 
 
 class UEUN_PT_panel(bpy.types.Panel):
@@ -518,6 +563,8 @@ class UEUN_PT_panel(bpy.types.Panel):
             layout.prop(props, "rename_image_paths")
         if props.last_manifest_path:
             layout.label(text=Path(props.last_manifest_path).name)
+        if props.last_pipeline_json_path:
+            layout.label(text=Path(props.last_pipeline_json_path).name)
         layout.operator("ue_unique_names.prepare", icon="CHECKMARK")
         layout.operator("ue_unique_names.restore", icon="LOOP_BACK")
 
