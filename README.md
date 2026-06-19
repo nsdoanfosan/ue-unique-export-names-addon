@@ -6,25 +6,22 @@ The panel now has two separate workflows.
 
 ## Painter workflow
 
-`Prepare Painter Asset`:
+`Link Painter Low to Export`:
 
-- keeps Painter texture image names and files unchanged;
-- infers each Texture Set from `T_<texture_set>_<role>.png`;
-- renames only the material to `M_<texture_set>`;
-- groups the `Baking/low` meshes into **one Empty per asset**:
-  - a mesh already parented to an Empty keeps that Empty (and its own name) — only
-    the Empty is renamed;
-  - a loose mesh (no Empty parent) gets a **new Empty** created for it, added to
-    both `Baking/low` and `Export`;
-- renames the Empties sequentially from the asset prefix (`Asset`, or `Asset_01`,
-  `Asset_02`, … when there are several);
-- links every Empty and its child meshes into `Export`;
-- preserves every child mesh name used for Painter bake matching;
-- writes the manifest and one combined Empty JSON sidecar per Empty.
+- links every mesh in `Baking/low` into `Export`;
+- links every object actually contained in `Baking/low`, including Empty
+  objects and their child meshes;
+- never creates an Empty or changes parenting/transforms;
+- never renames meshes, materials, textures, or Empty objects;
+- recognizes meshes present in both `Baking/low` and `Export`, so the External
+  Texture and Standalone Mesh naming workflows ignore them without stored tags;
+- protects shared mesh data, materials, images, and texture files used by the
+  linked Low meshes. Objects sharing that protected data are skipped as a unit;
+- accepts only Empty parent chains. It stops if the hierarchy contains a
+  non-Empty parent or an outside mesh sibling that could be exported by mistake.
 
-Grouping is therefore driven by how you parent meshes inside `low`: meshes under
-the same Empty export as one combined asset; loose meshes each become their own
-asset.
+Protection is calculated only when an operator runs. The panel redraw uses only
+the cheap `Baking/low` and `Export` object intersection.
 
 Enable Send to Unreal's `Combine > Child meshes` option. Each Empty name becomes
 the exported Unreal mesh asset name.
@@ -53,3 +50,16 @@ files. Unreal postprocess scripts can use them to move/update textures under
 `/Game/Material/Mesh/MI_Prop_Master`.
 
 The `.blend` file is not saved automatically.
+
+`Prepare Standalone Mesh Names` treats each top-level Export item as one unit.
+With prefix `A`, an Empty with two child meshes plus one standalone mesh becomes:
+
+```text
+A_01
+|- A_01_01
+`- A_01_02
+A_02
+```
+
+Mesh data names follow their object names. Parent relationships are preserved,
+and protected Painter-linked units are excluded.
