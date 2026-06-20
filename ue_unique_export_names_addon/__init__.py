@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UE Unique Export Names",
     "author": "Codex",
-    "version": (2, 6, 0),
+    "version": (2, 8, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > UE Names",
     "description": "Rename Blender materials/textures for Send to Unreal and write an Unreal postprocess manifest.",
@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 
 
@@ -23,7 +24,8 @@ BACKUP_FILEPATH_RAW_PROP = "_ue_unique_export_original_filepath_raw"
 # Legacy marker from versions that created Painter grouping Empties. Restore
 # still recognizes it so old .blend files can clean those generated objects up.
 CREATED_EMPTY_PROP = "_ue_unique_export_created_empty"
-LEGACY_PAINTER_EXPORT_LINK_PROP = "_ue_unique_export_painter_link"
+AUTO_PAINTER_EXPORT_LINK_PROP = "_ue_unique_export_auto_link"
+_painter_export_sync_running = False
 
 # Send to Unreal exports the objects inside a collection named "Export"; the addon's
 # default scope mirrors that so you don't have to manually select every object.
@@ -242,6 +244,91 @@ def external_materials_from_objects(context, objects, protected=None):
 def low_export_hierarchy(low_collection):
     """Every object actually contained in Baking/low, with parenting untouched."""
     return set(low_collection.all_objects)
+
+
+def painter_export_hierarchy(low_collection):
+    """Meshes in Baking/low plus their complete existing parent hierarchy."""
+    low_meshes = {
+        obj for obj in low_collection.all_objects
+        if obj.type == "MESH"
+    }
+    hierarchy = set(low_meshes)
+    for mesh in low_meshes:
+        parent = mesh.parent
+        while parent is not None:
+            hierarchy.add(parent)
+            parent = parent.parent
+    return hierarchy
+
+
+def sync_painter_export(scene=None):
+    """Keep Baking/low meshes and their parent chains linked into Export."""
+    global _painter_export_sync_running
+    if _painter_export_sync_running:
+        return {"linked": 0, "unlinked": 0, "desired": 0}
+
+    _painter_export_sync_running = True
+    try:
+        low_collection = baking_low_collection()
+        desired = (
+            painter_export_hierarchy(low_collection)
+            if low_collection is not None
+            else set()
+        )
+
+        export_coll = bpy.data.collections.get(EXPORT_COLLECTION_NAME)
+        if desired and export_coll is None:
+            if scene is None:
+                scene = bpy.context.scene
+            if scene is None and bpy.data.scenes:
+                scene = bpy.data.scenes[0]
+            if scene is None:
+                return {"linked": 0, "unlinked": 0, "desired": len(desired)}
+            export_coll = bpy.data.collections.new(EXPORT_COLLECTION_NAME)
+            scene.collection.children.link(export_coll)
+
+        linked = 0
+        if export_coll is not None:
+            for obj in sorted(desired, key=lambda item: item.name_full):
+                if export_coll.objects.get(obj.name) is not obj:
+                    export_coll.objects.link(obj)
+                    linked += 1
+                if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
+                    obj[AUTO_PAINTER_EXPORT_LINK_PROP] = True
+
+        unlinked = 0
+        for obj in list(bpy.data.objects):
+            if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
+                continue
+            if obj in desired:
+                continue
+            if export_coll is not None and export_coll.objects.get(obj.name) is obj:
+                export_coll.objects.unlink(obj)
+                unlinked += 1
+            del obj[AUTO_PAINTER_EXPORT_LINK_PROP]
+
+        return {
+            "linked": linked,
+            "unlinked": unlinked,
+            "desired": len(desired),
+        }
+    finally:
+        _painter_export_sync_running = False
+
+
+@persistent
+def sync_painter_export_on_load(_dummy):
+    sync_painter_export()
+
+
+@persistent
+def sync_painter_export_on_depsgraph(scene, _depsgraph):
+    sync_painter_export(scene)
+
+
+def sync_painter_export_deferred():
+    sync_painter_export()
+    return None
 
 
 def materials_from_objects(objects):
@@ -939,56 +1026,6 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class UEUN_OT_prepare_painter_asset(bpy.types.Operator):
-    bl_idname = "ue_unique_names.prepare_painter_asset"
-    bl_label = "Link Painter Low to Export"
-    bl_description = (
-        "Link every Baking/low mesh and its existing parent hierarchy into Export. "
-        "Names, materials, textures, parenting, and transforms are not changed. "
-        "Linked Low meshes are excluded from the workflows below"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        low_collection = baking_low_collection()
-        if low_collection is None:
-            self.report(
-                {"ERROR"},
-                "'Baking/low' 콜렉션을 찾지 못했습니다 (Baking/low collection not found).",
-            )
-            return {"CANCELLED"}
-
-        low_hierarchy = low_export_hierarchy(low_collection)
-        low_meshes = sorted(
-            [obj for obj in low_hierarchy if obj.type == "MESH"],
-            key=lambda obj: obj.name_full,
-        )
-        if not low_meshes:
-            self.report(
-                {"ERROR"},
-                "'Baking/low'에 메쉬가 없습니다 (Baking/low has no mesh objects).",
-            )
-            return {"CANCELLED"}
-
-        export_coll = ensure_export_collection(context)
-        for mesh in low_meshes:
-            if LEGACY_PAINTER_EXPORT_LINK_PROP in mesh:
-                del mesh[LEGACY_PAINTER_EXPORT_LINK_PROP]
-
-        newly_linked = 0
-        for obj in sorted(low_hierarchy, key=lambda item: item.name_full):
-            if export_coll.objects.get(obj.name) is None:
-                export_coll.objects.link(obj)
-                newly_linked += 1
-
-        self.report(
-            {"INFO"},
-            f"Baking/low 계층 {len(low_hierarchy)}개 오브젝트를 Export에 그대로 링크했습니다 "
-            f"({newly_linked} new object links). 이름·부모·머티리얼·텍스처 변경 없음.",
-        )
-        return {"FINISHED"}
-
-
 class UEUN_OT_restore_names(bpy.types.Operator):
     bl_idname = "ue_unique_names.restore"
     bl_label = "Restore Original Names"
@@ -1139,6 +1176,43 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class UEUN_OT_prepare_external_asset(bpy.types.Operator):
+    bl_idname = "ue_unique_names.prepare_external_asset"
+    bl_label = "Prepare External Asset"
+    bl_description = (
+        "Rename mesh objects/data first, then normalize external material and "
+        "texture names and write Unreal files"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        mesh_result = bpy.ops.ue_unique_names.prepare_mesh_names()
+        if "FINISHED" not in mesh_result:
+            self.report(
+                {"ERROR"},
+                "메쉬 이름 준비에 실패해 External 작업을 중단했습니다 "
+                "(mesh naming failed; external workflow stopped).",
+            )
+            return {"CANCELLED"}
+
+        texture_result = bpy.ops.ue_unique_names.prepare()
+        if "FINISHED" not in texture_result:
+            self.report(
+                {"ERROR"},
+                "메쉬 이름은 변경됐지만 텍스처 준비에 실패했습니다. "
+                "필요하면 Restore Original Names로 되돌리세요 "
+                "(mesh names changed, texture preparation failed).",
+            )
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            "External 작업 완료: 메쉬 이름 정리 후 텍스처를 정리했습니다 "
+            "(mesh names first, textures second).",
+        )
+        return {"FINISHED"}
+
+
 class UEUN_PG_settings(bpy.types.PropertyGroup):
     scope: EnumProperty(
         name="Scope",
@@ -1196,43 +1270,6 @@ class UEUN_PT_panel(bpy.types.Panel):
             layout.prop(props, "custom_prefix")
         layout.prop(props, "texture_export_dir")
 
-        painter_box = layout.box()
-        painter_box.label(text="Painter Workflow", icon="TEXTURE")
-        painter_box.label(text="Baking/low를 Export에 링크만 함 (names unchanged)")
-
-        # Lightweight live status so problems are visible before pressing a button.
-        status = painter_box.column(align=True)
-        low_collection = baking_low_collection()
-        if low_collection is None:
-            status.label(text="Baking/low 없음 (no Baking/low)", icon="ERROR")
-        else:
-            low_hierarchy = low_export_hierarchy(low_collection)
-            low_meshes = [
-                obj for obj in low_hierarchy if obj.type == "MESH"
-            ]
-            if not low_meshes:
-                status.label(text="low에 메쉬 없음 (no meshes)", icon="ERROR")
-            else:
-                status.label(
-                    text=f"low: 메쉬 {len(low_meshes)}개",
-                    icon="OUTLINER_OB_MESH",
-                )
-                status.label(
-                    text=f"전체 계층 {len(low_hierarchy)}개 오브젝트 함께 링크"
-                )
-        export_exists = export_collection(context) is not None
-        status.label(
-            text="Export 콜렉션 있음 (exists)" if export_exists
-            else "Export 콜렉션 생성 예정 (will be created)",
-            icon="OUTLINER_COLLECTION" if export_exists else "ADD",
-        )
-
-        painter_box.operator(
-            "ue_unique_names.prepare_painter_asset",
-            text="Link Painter Low to Export",
-            icon="LINKED",
-        )
-
         external_box = layout.box()
         external_box.label(text="External Texture Workflow", icon="FILE_IMAGE")
         external_box.prop(props, "scope")
@@ -1247,14 +1284,9 @@ class UEUN_PT_panel(bpy.types.Panel):
             icon="INFO" if ext_objects else "ERROR",
         )
         external_box.operator(
-            "ue_unique_names.prepare",
-            text="Prepare External Textures",
+            "ue_unique_names.prepare_external_asset",
+            text="Prepare External Asset",
             icon="CHECKMARK",
-        )
-        external_box.operator(
-            "ue_unique_names.prepare_mesh_names",
-            text="Prepare Standalone Mesh Names",
-            icon="MESH_DATA",
         )
         if props.last_manifest_path:
             layout.label(text=Path(props.last_manifest_path).name)
@@ -1267,7 +1299,7 @@ classes = (
     UEUN_PG_settings,
     UEUN_OT_prepare_mesh_names,
     UEUN_OT_prepare_names,
-    UEUN_OT_prepare_painter_asset,
+    UEUN_OT_prepare_external_asset,
     UEUN_OT_restore_names,
     UEUN_PT_panel,
 )
@@ -1277,9 +1309,25 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ue_unique_names = bpy.props.PointerProperty(type=UEUN_PG_settings)
+    if sync_painter_export_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(sync_painter_export_on_load)
+    if sync_painter_export_on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            sync_painter_export_on_depsgraph
+        )
+    if not bpy.app.timers.is_registered(sync_painter_export_deferred):
+        bpy.app.timers.register(sync_painter_export_deferred, first_interval=0.1)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(sync_painter_export_deferred):
+        bpy.app.timers.unregister(sync_painter_export_deferred)
+    if sync_painter_export_on_depsgraph in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(
+            sync_painter_export_on_depsgraph
+        )
+    if sync_painter_export_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(sync_painter_export_on_load)
     if hasattr(bpy.types.Scene, "ue_unique_names"):
         del bpy.types.Scene.ue_unique_names
     for cls in reversed(classes):
