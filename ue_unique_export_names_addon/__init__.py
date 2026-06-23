@@ -247,13 +247,22 @@ def low_export_hierarchy(low_collection):
 
 
 def painter_export_hierarchy(low_collection):
-    """Meshes in Baking/low plus their complete existing parent hierarchy."""
+    """Low meshes, their parents, and rigs referenced by Armature modifiers."""
     low_meshes = {
         obj for obj in low_collection.all_objects
         if obj.type == "MESH"
     }
     hierarchy = set(low_meshes)
     for mesh in low_meshes:
+        for modifier in mesh.modifiers:
+            if modifier.type != "ARMATURE" or modifier.object is None:
+                continue
+            rig = modifier.object
+            hierarchy.add(rig)
+            rig_parent = rig.parent
+            while rig_parent is not None:
+                hierarchy.add(rig_parent)
+                rig_parent = rig_parent.parent
         parent = mesh.parent
         while parent is not None:
             hierarchy.add(parent)
@@ -293,11 +302,13 @@ def sync_painter_export(scene=None):
                 if export_coll.objects.get(obj.name) is not obj:
                     export_coll.objects.link(obj)
                     linked += 1
-                if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
                     obj[AUTO_PAINTER_EXPORT_LINK_PROP] = True
 
         unlinked = 0
-        for obj in list(bpy.data.objects):
+        # Auto-linked objects live directly in Export, so cleanup only needs to
+        # inspect that small set instead of every object after every depsgraph update.
+        cleanup_candidates = list(export_coll.objects) if export_coll is not None else []
+        for obj in cleanup_candidates:
             if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
                 continue
             if obj in desired:
