@@ -4,6 +4,13 @@ Blender add-on for the final Blender-to-Unreal stage of the workflow built
 around PARK's [`substance-tools` fork](https://github.com/nsdoanfosan/substance-tools).
 It also prepares unrelated external-texture assets.
 
+Shared pipeline conventions (collection names, the `Export` collection, naming
+prefixes, JSON IPC files, Unreal path anchors) are the contract documented in
+the `substance-tools` repo:
+[`docs/pipeline_contract.md`](https://github.com/nsdoanfosan/substance-tools/blob/main/docs/pipeline_contract.md)
+and `pipeline_contract.json`. Treat that as the source of truth before changing
+any pipeline-facing names.
+
 The panel is in **3D Viewport > Sidebar (`N`) > UE Names**.
 
 ## Main Workflow: Substance Tools to Unreal
