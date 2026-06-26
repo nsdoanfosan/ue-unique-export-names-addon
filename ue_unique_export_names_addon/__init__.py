@@ -11,6 +11,7 @@ bl_info = {
 import bpy
 from bpy.props import BoolProperty
 
+from . import api
 from .gpro import unreal_handoff_materials_from_objects
 from .naming import material_texture_map, resolve_export_dir
 from .operators import (
@@ -32,6 +33,12 @@ from .painter_sync import (
 from .properties import UEUN_PG_settings
 from .ui import UEUN_PT_panel
 from .utils import asset_prefix, validation_scope_objects
+
+__all__ = (
+    "api",
+    "register",
+    "unregister",
+)
 
 classes = (
     UEUN_PG_settings,
