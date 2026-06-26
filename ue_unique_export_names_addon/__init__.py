@@ -146,6 +146,76 @@ def json_scope_mesh_objects(context, scope):
     return [obj for obj in objects if obj.type == "MESH"]
 
 
+def scope_objects_for_validation(context, scope):
+    if scope == "SELECTED":
+        return list(context.selected_objects)
+    if scope == "EXPORT_COLLECTION":
+        coll = export_collection(context)
+        return list(coll.all_objects) if coll else []
+    return list(context.scene.objects)
+
+
+def is_edit_mesh_modifier(modifier):
+    modifier_name = clean_token(getattr(modifier, "name", "")).casefold()
+    node_group = getattr(modifier, "node_group", None)
+    node_group_name = clean_token(getattr(node_group, "name", "")).casefold()
+    return "edit_mesh" in {modifier_name, node_group_name}
+
+
+def is_hair_tool_object(obj):
+    if not obj or obj.type not in {"CURVES", "MESH"}:
+        return False
+    if any(is_edit_mesh_modifier(modifier) for modifier in obj.modifiers):
+        return False
+    node_group_names = {
+        modifier.node_group.name
+        for modifier in obj.modifiers
+        if modifier.type == "NODES" and modifier.node_group
+    }
+    return (
+        any(name.startswith("Hair_System_Setup") for name in node_group_names)
+        and any(name.startswith("Hair_System_Profile") for name in node_group_names)
+    )
+
+
+def hair_tool_input_object(obj):
+    for modifier in obj.modifiers:
+        if (
+            modifier.type != "NODES"
+            or not modifier.node_group
+            or not modifier.node_group.name.startswith("Hair_System_Setup")
+        ):
+            continue
+        try:
+            input_object = modifier.get("Input_3")
+        except (KeyError, TypeError):
+            input_object = None
+        if isinstance(input_object, bpy.types.Object):
+            return input_object
+    return None
+
+
+def validation_scope_objects(context, scope):
+    objects = scope_objects_for_validation(context, scope)
+    mesh_objects = [obj for obj in objects if obj.type == "MESH"]
+    hair_candidates = [obj for obj in objects if is_hair_tool_object(obj)]
+    upstream_hair = {
+        input_object
+        for input_object in (hair_tool_input_object(obj) for obj in hair_candidates)
+        if input_object in hair_candidates
+    }
+    rows = []
+    seen = set()
+    for obj in [*mesh_objects, *hair_candidates]:
+        if obj in upstream_hair:
+            continue
+        if obj.name in seen:
+            continue
+        rows.append(obj)
+        seen.add(obj.name)
+    return rows
+
+
 def parent_chain(obj):
     """Return all parents from the top-most parent down to the direct parent."""
     chain = []
@@ -226,18 +296,14 @@ def protected_painter_data(context):
         for material in bpy.data.materials
         if images_from_material(material) & images
     )
+    # Object protection is only for objects/mesh-data that are actually part of
+    # the Painter low hierarchy. Materials and images are protected separately
+    # below; sharing a protected material must not make an Export mesh immutable.
     objects.update(
         obj
         for obj in bpy.data.objects
         if obj.type == "MESH"
-        and (
-            obj.data in meshes
-            or any(
-                slot.material in materials
-                for slot in obj.material_slots
-                if slot.material is not None
-            )
-        )
+        and obj.data in meshes
     )
     return {
         "objects": objects,
@@ -726,6 +792,34 @@ def mesh_name_for(prefix, index, object_count):
     return prefix if object_count == 1 else f"{prefix}_{index + 1:02d}"
 
 
+def external_workflow_preview_rows(context, props, objects):
+    prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
+    rows = []
+    units = export_naming_units(context, props.scope, objects)
+    for unit_index, unit in enumerate(units):
+        unit_name = mesh_name_for(prefix, unit_index, len(units))
+        root = unit["root"]
+        meshes = unit["meshes"]
+        if root.type == "EMPTY":
+            for child_index, mesh in enumerate(meshes, 1):
+                rows.append(
+                    {
+                        "object": mesh.name,
+                        "group": root.name,
+                        "planned": f"{unit_name}_{child_index:02d}",
+                    }
+                )
+        else:
+            rows.append(
+                {
+                    "object": root.name,
+                    "group": "",
+                    "planned": unit_name,
+                }
+            )
+    return rows
+
+
 def top_empty_parent(obj, scope_objects):
     """Highest Empty ancestor that is still inside the naming scope."""
     top = None
@@ -976,7 +1070,34 @@ def transfer_weights_enabled(obj):
 
 
 def transfer_check_label(enabled):
-    return "✓" if enabled else "-"
+    return "Yes" if enabled else "-"
+
+
+def export_kind_for_object(obj, painter_low=False):
+    if is_hair_tool_object(obj):
+        return "Hair"
+    if painter_low:
+        return "Low"
+    return "Mesh"
+
+
+def export_action_for_object(obj, painter_low=False):
+    if is_hair_tool_object(obj):
+        return "Hair bake"
+    if painter_low:
+        return "Painter low"
+    return "Mesh export"
+
+
+def export_detail_lines_for_object(obj):
+    if not is_hair_tool_object(obj):
+        return []
+    return [
+        "Hair Tool source: Send2UE bakes this object to a temporary mesh before FBX export.",
+        "Generated mesh: evaluated cards are joined per export asset, UVMapGN becomes UVMap, and RSAO is packed from Random/SystemColor/AO.",
+        "Rigging: the export mesh gets the detected head bone vertex group at weight 1.0 plus an Armature modifier.",
+        "Transfer: Shape Keys / Weights are read from the JSON sidecar before Send2UE exports the baked mesh.",
+    ]
 
 
 def transfer_postprocess_entry(obj):
@@ -995,7 +1116,7 @@ def transfer_postprocess_entry(obj):
 def export_validation_rows(context, props=None, objects=None, materials=None, texture_map=None):
     if props is None:
         props = context.scene.ue_unique_names
-    objects = list(objects) if objects is not None else json_scope_mesh_objects(context, props.scope)
+    objects = list(objects) if objects is not None else validation_scope_objects(context, props.scope)
     materials = list(materials) if materials is not None else unreal_handoff_materials_from_objects(objects)
     if texture_map is None:
         texture_map = material_texture_map(materials)
@@ -1020,14 +1141,17 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
         armatures = armature_names_for_object(obj)
         texture_roles = texture_roles_for_materials(handoff_materials, texture_map)
         unit_root = top_empty_parent(obj, export_objects) or obj
+        painter_low = obj in painter_low_objects
         errors = []
         warnings = []
 
-        if not material_slots:
+        if painter_low:
+            pass
+        elif not material_slots:
             errors.append("No material slots")
-        elif not handoff_materials:
+        elif not handoff_materials and not is_hair_tool_object(obj):
             warnings.append("No UE handoff material")
-        if empty_slot_count:
+        if empty_slot_count and not painter_low:
             errors.append(f"{empty_slot_count} empty material slot")
 
         if clean_token(obj.name) != obj.name:
@@ -1043,7 +1167,6 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
                 errors.append(f"{material.name} has no M_ prefix")
             textures = texture_map.get(material, {})
             if not textures:
-                warnings.append(f"{material.name} has no image textures")
                 continue
             for role, image in textures.items():
                 source_value = image.filepath_raw or image.filepath
@@ -1065,6 +1188,9 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
                 "transfer_source": transfer_source_name_for_object(obj),
                 "transfer_shape_keys": transfer_shape_keys_enabled(obj),
                 "transfer_weights": transfer_weights_enabled(obj),
+                "export_kind": export_kind_for_object(obj, painter_low=painter_low),
+                "export_action": export_action_for_object(obj, painter_low=painter_low),
+                "export_details": export_detail_lines_for_object(obj),
                 "material_slots": [
                     material.name if material else ""
                     for material in (slot.material for slot in material_slots)
@@ -1072,7 +1198,7 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
                 "handoff_materials": [material.name for material in handoff_materials],
                 "texture_roles": texture_roles,
                 "painter_protected": obj in protected["objects"],
-                "painter_low": obj in painter_low_objects,
+                "painter_low": painter_low,
                 "status": status,
                 "errors": unique_ordered_names(errors),
                 "warnings": unique_ordered_names(warnings),
@@ -1087,6 +1213,19 @@ def validation_summary(rows):
     for row in rows:
         counts[row["status"]] += 1
     return counts
+
+
+def validation_pipeline_summary(rows):
+    return {
+        "low": sum(1 for row in rows if row.get("painter_low")),
+        "hair": sum(1 for row in rows if row.get("export_kind") == "Hair"),
+        "transfer": sum(
+            1
+            for row in rows
+            if row.get("transfer_source")
+            and (row.get("transfer_shape_keys") or row.get("transfer_weights"))
+        ),
+    }
 
 
 def validation_icon(status):
@@ -1178,7 +1317,7 @@ VALIDATION_SPREADSHEET_MESH = "_UEUN_Export_Validation_Table_Mesh"
 
 
 def validation_spreadsheet_rows(context, props):
-    objects = json_scope_mesh_objects(context, props.scope)
+    objects = validation_scope_objects(context, props.scope)
     materials = unreal_handoff_materials_from_objects(objects)
     texture_map = material_texture_map(materials)
     rows = export_validation_rows(
@@ -1195,6 +1334,8 @@ def validation_spreadsheet_rows(context, props):
                 {
                     "Status": row_data["status"],
                     "Group": row_data["asset_unit"] or "-",
+                    "Kind": row_data["export_kind"],
+                    "Export_Action": row_data["export_action"],
                     "Mesh_Object": row_data["object_name"],
                     "Rig": compact_list_label(row_data["armatures"], limit=2),
                     "Transfer_Source": row_data["transfer_source"] or "-",
@@ -1232,7 +1373,9 @@ def create_validation_spreadsheet_object(context, props):
             {
                 "Status": "-",
                 "Group": "-",
-                "Mesh_Object": "No mesh rows to validate.",
+                "Kind": "-",
+                "Export_Action": "-",
+                "Mesh_Object": "No export targets to validate.",
                 "Rig": "-",
                 "Transfer_Source": "-",
                 "Shape_Keys": "-",
@@ -1317,6 +1460,7 @@ def draw_validation_wide_header(layout):
     fixed_table_column(header, 1.1).label(text="")
     fixed_table_column(header, 4.5).label(text="Status")
     fixed_table_column(header, 22.0).label(text="Mesh Object")
+    fixed_table_column(header, 10.0).label(text="Export")
     fixed_table_column(header, 5.5).label(text="Rig")
     fixed_table_column(header, 7.0).label(text="Mat")
     fixed_table_column(header, 5.0).label(text="Tex")
@@ -1342,6 +1486,10 @@ def draw_validation_wide_row(layout, row_data, has_group_header, expanded):
         if has_group_header else row_data["object_name"]
     )
     fixed_table_column(row, 22.0).label(text=mesh_text, icon="OUTLINER_OB_MESH")
+    fixed_table_column(row, 10.0).label(
+        text=row_data["export_action"],
+        icon="INFO" if row_data["export_kind"] == "Hair" else "CHECKMARK",
+    )
     fixed_table_column(row, 5.5).label(
         text=compact_list_label(row_data["armatures"], limit=2),
         icon="OUTLINER_OB_ARMATURE" if row_data["armatures"] else "BLANK1",
@@ -1385,6 +1533,23 @@ def draw_validation_detail(layout, row_data):
         detail,
         "Texture Roles: " + compact_list_label(row_data["texture_roles"], limit=6),
     )
+    draw_wrapped_label(detail, f"Export Action: {row_data['export_action']}")
+    for line in row_data["export_details"]:
+        draw_wrapped_label(detail, "  " + line, icon="INFO")
+    if row_data["transfer_shape_keys"] or row_data["transfer_weights"] or row_data["transfer_source"]:
+        transfer_bits = []
+        if row_data["transfer_shape_keys"]:
+            transfer_bits.append("Shape Keys")
+        if row_data["transfer_weights"]:
+            transfer_bits.append("Weights")
+        draw_wrapped_label(
+            detail,
+            "Transfer Source: "
+            + (row_data["transfer_source"] or "-")
+            + " / "
+            + compact_list_label(transfer_bits),
+            icon="MOD_DATA_TRANSFER",
+        )
     source = []
     if row_data["painter_low"]:
         source.append("Painter Low")
@@ -1473,8 +1638,11 @@ def write_unreal_pipeline_json(
     }
 
     if not combined_only:
-        # Per mesh-object sidecar for the normal non-combined export workflow.
+        # Per standalone mesh-object sidecar. Child meshes under an Empty export
+        # as the Empty/group asset, so their contract lives in the Empty JSON.
         for obj in objects:
+            if obj.parent and obj.parent.type == "EMPTY":
+                continue
             mesh_name = clean_token(obj.name)
             entries = []
             seen_materials = set()
@@ -1555,14 +1723,36 @@ def write_unreal_pipeline_json(
             )
 
     if json_paths:
+        cleanup_stale_pipeline_sidecars(json_dir, objects, json_paths)
         context.scene.ue_unique_names.last_pipeline_json_path = str(json_paths[-1])
     return json_paths
+
+
+def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths):
+    keep = {Path(path).resolve() for path in keep_paths}
+    candidate_names = {clean_token(obj.name) for obj in objects}
+    for obj in objects:
+        parent = obj.parent
+        if parent and parent.type == "EMPTY":
+            candidate_names.add(clean_token(parent.name))
+    for name in candidate_names:
+        path = (json_dir / f"{name}.json").resolve()
+        if path in keep or not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _json_target_names(objects, combined_only=False):
     names = []
     if not combined_only:
-        names.extend(obj.name for obj in objects)
+        names.extend(
+            obj.name
+            for obj in objects
+            if not (obj.parent and obj.parent.type == "EMPTY")
+        )
 
     object_names = {clean_token(obj.name) for obj in objects}
     children_by_empty = {}
@@ -1594,7 +1784,7 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
     if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
         errors.append("Export collection does not exist.")
     if not objects:
-        errors.append("No mesh objects in the selected JSON scope.")
+        errors.append("No export objects in the selected JSON scope.")
         return errors
     if not materials:
         errors.append("No materials found in the selected JSON scope.")
@@ -1676,15 +1866,20 @@ def draw_export_validation_table(layout, context, props, objects, materials, tex
         texture_map=texture_map,
     )
     counts = validation_summary(rows)
+    pipeline_counts = validation_pipeline_summary(rows)
     expanded_names = validation_expanded_names(props)
 
     table = layout.box()
     table.label(text="Export Validation Table", icon="VIEWZOOM")
     summary = table.row(align=True)
-    summary.label(text=f"Meshes {len(rows)}", icon="OUTLINER_OB_MESH")
+    summary.label(text=f"Targets {len(rows)}", icon="OUTLINER_OB_MESH")
     summary.label(text=f"OK {counts['OK']}", icon="CHECKMARK")
     summary.label(text=f"Warn {counts['WARN']}", icon="ERROR")
     summary.label(text=f"Err {counts['ERROR']}", icon="CANCEL")
+    pipeline = table.row(align=True)
+    pipeline.label(text=f"Low {pipeline_counts['low']}", icon="LINKED")
+    pipeline.label(text=f"Hair bake {pipeline_counts['hair']}", icon="INFO")
+    pipeline.label(text=f"Transfer {pipeline_counts['transfer']}", icon="MOD_DATA_TRANSFER")
     table.operator(
         "ue_unique_names.open_validation_sheet",
         text="Open Spreadsheet Window",
@@ -1695,13 +1890,14 @@ def draw_export_validation_table(layout, context, props, objects, materials, tex
     header.label(text="")
     header.label(text="Status")
     header.label(text="Mesh")
+    header.label(text="Export")
     header.label(text="Rig")
     header.label(text="M")
     header.label(text="T")
     header.label(text="JSON")
 
     if not rows:
-        table.label(text="No mesh rows to validate.", icon="ERROR")
+        table.label(text="No export targets to validate.", icon="ERROR")
         return
 
     for group in grouped_validation_rows(rows):
@@ -1737,6 +1933,10 @@ def draw_export_validation_table(layout, context, props, objects, materials, tex
             )
             mesh_text = f"  {display_name}" if has_group_header else display_name
             row.label(text=mesh_text, icon="OUTLINER_OB_MESH")
+            row.label(
+                text=row_data["export_action"],
+                icon="INFO" if row_data["export_kind"] == "Hair" else "CHECKMARK",
+            )
             row.label(
                 text="Arm" if row_data["armatures"] else "-",
                 icon="OUTLINER_OB_ARMATURE" if row_data["armatures"] else "BLANK1",
@@ -1774,16 +1974,60 @@ def draw_export_transfer_source(layout, context):
     else:
         box.label(text="Source not set.", icon="ERROR")
 
-    if obj.type == "MESH":
+    if obj.type in {"MESH", "CURVES"}:
         if hasattr(context.scene, "vdt_props"):
             box.prop(context.scene.vdt_props, "overwrite_shape_keys")
 
         row = box.row(align=True)
         row.prop(obj, "ue_unique_transfer_shape_keys", text="Shape Keys", toggle=True, icon="SHAPEKEY_DATA")
         row.prop(obj, "ue_unique_transfer_weights", text="Weights", toggle=True, icon="MOD_VERTEX_WEIGHT")
-        box.label(text="Checked items are written for Unreal postprocess.", icon="INFO")
-    else:
-        box.label(text="Used automatically during export.", icon="INFO")
+        if obj.type == "CURVES":
+            box.label(text="Checked items apply to the generated export mesh.", icon="INFO")
+        else:
+            box.label(text="Checked items are written for Unreal postprocess.", icon="INFO")
+
+
+def draw_external_workflow_preview(layout, context, props):
+    objects, painter_objects, _protected = mutation_safe_mesh_objects(context, props.scope)
+    rows = external_workflow_preview_rows(context, props, objects)
+    total = len(objects) + len(painter_objects)
+    layout.label(
+        text=f"Classified meshes {total}",
+        icon="INFO" if total else "ERROR",
+    )
+    layout.label(
+        text=f"External targets {len(objects)}",
+        icon="INFO" if objects else "ERROR",
+    )
+    if not objects:
+        layout.label(text="No external mesh targets.", icon="ERROR")
+        return
+
+    preview = layout.column(align=True)
+    preview.label(text="Mesh rename preview", icon="VIEWZOOM")
+    for row_data in rows[:8]:
+        draw_wrapped_label(preview, row_data["object"], icon="OUTLINER_OB_MESH", width=34)
+        after = compact_name(row_data["planned"], limit=22)
+        preview.label(text=f"  -> {after}", icon="CHECKMARK")
+        if row_data.get("group"):
+            preview.label(
+                text=f"  in {compact_name(row_data['group'], limit=34)}",
+                icon="EMPTY_AXIS",
+            )
+    if len(rows) > 8:
+        preview.label(text=f"+{len(rows) - 8} more", icon="INFO")
+
+    if painter_objects:
+        painter = layout.column(align=True)
+        painter.label(
+            text=f"Substance/Painter data {len(painter_objects)}",
+            icon="INFO",
+        )
+        for obj in painter_objects[:8]:
+            draw_wrapped_label(painter, obj.name, icon="OUTLINER_OB_MESH", width=34)
+            painter.label(text="  handled by the Substance low workflow")
+        if len(painter_objects) > 8:
+            painter.label(text=f"+{len(painter_objects) - 8} more", icon="INFO")
 
 
 class UEUN_OT_prepare_names(bpy.types.Operator):
@@ -1957,7 +2201,7 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.ue_unique_names
         prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
-        objects = json_scope_mesh_objects(context, props.scope)
+        objects = validation_scope_objects(context, props.scope)
         materials = unreal_handoff_materials_from_objects(objects)
         texture_map = material_texture_map(materials)
 
@@ -1970,9 +2214,11 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
         )
         if errors:
             props.last_handoff_status = f"Blocked: {len(errors)} issue(s), JSON not updated"
-            visible_errors = ["JSON not updated. Fix issues below, then run again.", *errors[:7]]
-            if len(errors) > 7:
-                visible_errors.append(f"... +{len(errors) - 7} more in the console")
+            visible_errors = [
+                "JSON not updated. Fix the validation table, then run again.",
+                f"Blocking issues: {len(errors)}",
+                f"First: {errors[0]}",
+            ]
             props.last_handoff_log = "\n".join(visible_errors)
             _report_validation_errors(self, errors)
             return {"CANCELLED"}
@@ -2000,16 +2246,21 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
             return {"CANCELLED"}
 
         refreshed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = export_validation_rows(
+            context,
+            props=props,
+            objects=objects,
+            materials=materials,
+            texture_map=texture_map,
+        )
+        pipeline_counts = validation_pipeline_summary(rows)
         props.last_handoff_status = f"Ready: JSON refreshed {refreshed_at}"
-        visible_paths = [Path(path).name for path in json_paths[:6]]
-        if len(json_paths) > len(visible_paths):
-            visible_paths.append(f"... +{len(json_paths) - len(visible_paths)} more")
         props.last_handoff_log = "\n".join(
             [
                 f"Updated: {refreshed_at}",
-                f"Folder: {export_dir}",
                 f"JSON files: {len(json_paths)}",
-                *visible_paths,
+                f"Targets: {len(rows)} / Low {pipeline_counts['low']} / Hair bake {pipeline_counts['hair']} / Transfer {pipeline_counts['transfer']}",
+                f"Folder: {export_dir}",
             ]
         )
         self.report(
@@ -2052,7 +2303,7 @@ class UEUN_OT_open_validation_sheet(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         props = context.scene.ue_unique_names
-        objects = json_scope_mesh_objects(context, props.scope)
+        objects = validation_scope_objects(context, props.scope)
         materials = unreal_handoff_materials_from_objects(objects)
         texture_map = material_texture_map(materials)
         rows = export_validation_rows(
@@ -2063,16 +2314,21 @@ class UEUN_OT_open_validation_sheet(bpy.types.Operator):
             texture_map=texture_map,
         )
         counts = validation_summary(rows)
+        pipeline_counts = validation_pipeline_summary(rows)
 
         layout.label(text="Export Validation Table", icon="SPREADSHEET")
         summary = layout.row(align=True)
-        summary.label(text=f"Meshes {len(rows)}", icon="OUTLINER_OB_MESH")
+        summary.label(text=f"Targets {len(rows)}", icon="OUTLINER_OB_MESH")
         summary.label(text=f"OK {counts['OK']}", icon="CHECKMARK")
         summary.label(text=f"Warn {counts['WARN']}", icon="ERROR")
         summary.label(text=f"Err {counts['ERROR']}", icon="CANCEL")
+        pipeline = layout.row(align=True)
+        pipeline.label(text=f"Low {pipeline_counts['low']}", icon="LINKED")
+        pipeline.label(text=f"Hair bake {pipeline_counts['hair']}", icon="INFO")
+        pipeline.label(text=f"Transfer {pipeline_counts['transfer']}", icon="MOD_DATA_TRANSFER")
 
         if not rows:
-            layout.label(text="No mesh rows to validate.", icon="ERROR")
+            layout.label(text="No export targets to validate.", icon="ERROR")
             return
 
         expanded_names = validation_expanded_names(props)
@@ -2329,6 +2585,21 @@ class UEUN_PG_settings(bpy.types.PropertyGroup):
     validation_expanded_rows: StringProperty(name="Expanded Validation Rows", default="")
 
 
+def handoff_log_display_lines(log_text):
+    lines = []
+    for line in str(log_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.casefold()
+        if lower.endswith(".json"):
+            continue
+        if lower.startswith("... +") and "more" in lower:
+            continue
+        lines.append(stripped)
+    return lines
+
+
 class UEUN_PT_panel(bpy.types.Panel):
     bl_label = "UE Unique Names"
     bl_idname = "UEUN_PT_panel"
@@ -2343,9 +2614,9 @@ class UEUN_PT_panel(bpy.types.Panel):
         handoff_box.label(text="Unreal Handoff", icon="EXPORT")
         handoff_box.prop(props, "scope")
         handoff_box.prop(props, "texture_export_dir")
-        json_objects = json_scope_mesh_objects(context, props.scope)
+        json_objects = validation_scope_objects(context, props.scope)
         handoff_box.label(
-            text=f"Target meshes {len(json_objects)}",
+            text=f"Export targets {len(json_objects)}",
             icon="INFO" if json_objects else "ERROR",
         )
         json_materials = unreal_handoff_materials_from_objects(json_objects)
@@ -2369,7 +2640,7 @@ class UEUN_PT_panel(bpy.types.Panel):
                 text=props.last_handoff_status or "Last handoff check",
                 icon="CHECKMARK" if props.last_handoff_status.startswith("Ready") else "ERROR",
             )
-            for line in props.last_handoff_log.splitlines():
+            for line in handoff_log_display_lines(props.last_handoff_log):
                 log_box.label(text=line)
 
         draw_export_transfer_source(layout, context)
@@ -2384,11 +2655,7 @@ class UEUN_PT_panel(bpy.types.Panel):
             external_box.prop(props, "write_manifest")
         else:
             external_box.prop(props, "rename_image_paths")
-        ext_objects = selected_or_all_mesh_objects(context, props.scope)
-        external_box.label(
-            text=f"대상 메쉬 {len(ext_objects)}개 (target meshes)",
-            icon="INFO" if ext_objects else "ERROR",
-        )
+        draw_external_workflow_preview(external_box, context, props)
         external_box.operator(
             "ue_unique_names.prepare_external_asset",
             text="Prepare External Asset",
@@ -2466,7 +2733,10 @@ def unregister():
     if hasattr(bpy.types.Object, "ue_unique_transfer_shape_keys"):
         del bpy.types.Object.ue_unique_transfer_shape_keys
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
