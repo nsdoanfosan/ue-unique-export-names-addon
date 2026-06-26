@@ -437,12 +437,85 @@ def sync_painter_export_deferred():
     return None
 
 
+def is_gpro_instance_modifier(modifier):
+    modifier_name = clean_token(getattr(modifier, "name", "")).casefold()
+    node_group = getattr(modifier, "node_group", None)
+    node_group_name = clean_token(getattr(node_group, "name", "")).casefold() if node_group else ""
+    return "gpro_instance" in {modifier_name, node_group_name}
+
+
+def gpro_instance_collections(obj):
+    collections = []
+    seen = set()
+    for modifier in obj.modifiers:
+        if not is_gpro_instance_modifier(modifier):
+            continue
+        for key in ("Socket_2",):
+            value = modifier.get(key)
+            if isinstance(value, bpy.types.Collection) and value.name not in seen:
+                collections.append(value)
+                seen.add(value.name)
+        for key in modifier.keys():
+            value = modifier.get(key)
+            if isinstance(value, bpy.types.Collection) and value.name not in seen:
+                collections.append(value)
+                seen.add(value.name)
+    return collections
+
+
+def effective_material_slot_entries(obj, _visited_objects=None, _visited_collections=None):
+    if _visited_objects is None:
+        _visited_objects = set()
+    if _visited_collections is None:
+        _visited_collections = set()
+    if obj.name in _visited_objects:
+        return []
+    _visited_objects.add(obj.name)
+
+    entries = []
+    for slot_index, slot in enumerate(obj.material_slots):
+        entries.append((slot_index, slot.material, f"{obj.name} slot {slot_index}"))
+
+    next_index = len(entries)
+    for collection in gpro_instance_collections(obj):
+        if collection.name in _visited_collections:
+            continue
+        _visited_collections.add(collection.name)
+        for source in collection.all_objects:
+            if source.type != "MESH":
+                continue
+            for source_slot_index, slot in enumerate(source.material_slots):
+                entries.append(
+                    (
+                        next_index,
+                        slot.material,
+                        f"{obj.name} gPro {collection.name}/{source.name} slot {source_slot_index}",
+                    )
+                )
+                next_index += 1
+            for _nested_slot_index, nested_mat, nested_location in effective_material_slot_entries(
+                source,
+                _visited_objects=_visited_objects,
+                _visited_collections=_visited_collections,
+            ):
+                entries.append((next_index, nested_mat, f"{obj.name} gPro {nested_location}"))
+                next_index += 1
+    return entries
+
+
+def effective_material_names(obj):
+    return [mat.name if mat else "" for _slot_index, mat, _location in effective_material_slot_entries(obj)]
+
+
+def has_gpro_instance_material_source(obj):
+    return bool(gpro_instance_collections(obj))
+
+
 def materials_from_objects(objects):
     materials = []
     seen = set()
     for obj in objects:
-        for slot in obj.material_slots:
-            mat = slot.material
+        for _slot_index, mat, _location in effective_material_slot_entries(obj):
             if mat and not mat.library and mat.name not in seen:
                 materials.append(mat)
                 seen.add(mat.name)
@@ -453,8 +526,7 @@ def materials_from_objects_readonly(objects):
     materials = []
     seen = set()
     for obj in objects:
-        for slot in obj.material_slots:
-            mat = slot.material
+        for _slot_index, mat, _location in effective_material_slot_entries(obj):
             if mat and mat.name not in seen:
                 materials.append(mat)
                 seen.add(mat.name)
@@ -471,8 +543,7 @@ def unreal_handoff_materials_from_objects(objects):
     materials = []
     seen = set()
     for obj in objects:
-        for slot in obj.material_slots:
-            mat = slot.material
+        for _slot_index, mat, _location in effective_material_slot_entries(obj):
             if (
                 mat
                 and is_unreal_handoff_material(mat)
@@ -486,11 +557,10 @@ def unreal_handoff_materials_from_objects(objects):
 def material_usage_lookup(objects):
     usage = {}
     for obj in objects:
-        for slot_index, slot in enumerate(obj.material_slots):
-            mat = slot.material
+        for _slot_index, mat, location in effective_material_slot_entries(obj):
             if mat is None:
                 continue
-            usage.setdefault(mat, []).append(f"{obj.name} slot {slot_index}")
+            usage.setdefault(mat, []).append(location)
     return usage
 
 
@@ -611,6 +681,8 @@ def fallback_role_from_node(node):
     text = clean_token(f"{node.label}_{node.name}").lower()
     if "base" in text or "albedo" in text or "diffuse" in text or "color" in text:
         return "BaseColor"
+    if "extra" in text:
+        return "MetallicRoughness"
     if "metal" in text and ("rough" in text or "orm" in text or "mra" in text):
         return "MetallicRoughness"
     if "rough" in text:
@@ -914,7 +986,7 @@ def write_manifest(context, prefix, objects, materials, texture_map, export_dir)
         manifest["objects"].append(
             {
                 "name": obj.name,
-                "material_slots": [slot.material.name if slot.material else "" for slot in obj.material_slots],
+                "material_slots": effective_material_names(obj),
             }
         )
 
@@ -942,8 +1014,8 @@ def write_manifest(context, prefix, objects, materials, texture_map, export_dir)
 
 def first_slot_index_for_material(objects, material):
     for obj in objects:
-        for slot_index, slot in enumerate(obj.material_slots):
-            if slot.material == material:
+        for slot_index, mat, _location in effective_material_slot_entries(obj):
+            if mat == material:
                 return slot_index
     return 0
 
@@ -964,15 +1036,29 @@ def surface_layer_param_for_role(role):
     return SURFACE_LAYER_PARAM_BY_ROLE.get(role, role)
 
 
+def is_layerblend_material_name(material_name):
+    return clean_token(material_name).lower().startswith("m_layerblend_")
+
+
 def _texture_json_entry(role, image, param=None):
+    source_path = bpy.path.abspath(image.filepath_raw or image.filepath).replace("\\", "/")
     entry = {
         "param": param or role,
-        "asset_name": image.name,
-        "file": bpy.path.abspath(image.filepath_raw or image.filepath).replace("\\", "/"),
+        "asset_name": texture_asset_name_for_image(image, source_path),
+        "file": source_path,
     }
     if param and param != role:
         entry["source_param"] = role
     return entry
+
+
+def texture_asset_name_for_image(image, source_path=None):
+    source_path = source_path or bpy.path.abspath(image.filepath_raw or image.filepath)
+    stem = Path(source_path).stem if source_path else image.name
+    clean_name = clean_token(stem)
+    if clean_name.startswith("T_"):
+        return clean_name
+    return f"T_{clean_name}"
 
 
 def _material_layer_json_entries(mat, texture_map):
@@ -997,6 +1083,8 @@ def _material_layer_json_entries(mat, texture_map):
 
 def master_preset_for_material(mat):
     name = clean_token(mat.name).lower()
+    if is_layerblend_material_name(mat.name):
+        return "layer"
     if "cloth" in name or "clothes" in name:
         return "cloth"
     return None
@@ -1008,6 +1096,7 @@ def _material_json_entry(mat, slot_index, texture_map):
         textures.append(_texture_json_entry(role, image))
     entry = {
         "name": mat.name,
+        "slot_name": mat.name,
         "slot_index": slot_index,
         "translucent": is_translucent_material(mat),
         "textures": textures,
@@ -1128,14 +1217,14 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
     rows = []
 
     for obj in objects:
-        material_slots = list(obj.material_slots)
+        material_slots = effective_material_slot_entries(obj)
         handoff_materials = [
-            slot.material
-            for slot in material_slots
-            if slot.material and is_unreal_handoff_material(slot.material)
+            mat
+            for _slot_index, mat, _location in material_slots
+            if mat and is_unreal_handoff_material(mat)
         ]
         empty_slot_count = len(material_slots) - len(
-            [slot for slot in material_slots if slot.material]
+            [mat for _slot_index, mat, _location in material_slots if mat]
         )
         parent_names = [parent.name for parent in parent_chain(obj)]
         armatures = armature_names_for_object(obj)
@@ -1151,7 +1240,7 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
             errors.append("No material slots")
         elif not handoff_materials and not is_hair_tool_object(obj):
             warnings.append("No UE handoff material")
-        if empty_slot_count and not painter_low:
+        if empty_slot_count and not painter_low and not has_gpro_instance_material_source(obj):
             errors.append(f"{empty_slot_count} empty material slot")
 
         if clean_token(obj.name) != obj.name:
@@ -1192,8 +1281,8 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
                 "export_action": export_action_for_object(obj, painter_low=painter_low),
                 "export_details": export_detail_lines_for_object(obj),
                 "material_slots": [
-                    material.name if material else ""
-                    for material in (slot.material for slot in material_slots)
+                    mat.name if mat else ""
+                    for _slot_index, mat, _location in material_slots
                 ],
                 "handoff_materials": [material.name for material in handoff_materials],
                 "texture_roles": texture_roles,
@@ -1646,8 +1735,7 @@ def write_unreal_pipeline_json(
             mesh_name = clean_token(obj.name)
             entries = []
             seen_materials = set()
-            for slot_index, slot in enumerate(obj.material_slots):
-                mat = slot.material
+            for slot_index, mat, _location in effective_material_slot_entries(obj):
                 if (
                     not mat
                     or not is_unreal_handoff_material(mat)
@@ -1691,8 +1779,7 @@ def write_unreal_pipeline_json(
         seen_materials = set()
         slot_index = 0
         for obj in children_by_empty[empty.name]:
-            for slot in obj.material_slots:
-                mat = slot.material
+            for _source_slot_index, mat, _location in effective_material_slot_entries(obj):
                 if (
                     not mat
                     or not is_unreal_handoff_material(mat)
@@ -1800,17 +1887,18 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
 
     for obj in objects:
         handoff_slots = [
-            slot
-            for slot in obj.material_slots
-            if slot.material and is_unreal_handoff_material(slot.material)
+            (slot_index, mat)
+            for slot_index, mat, _location in effective_material_slot_entries(obj)
+            if mat and is_unreal_handoff_material(mat)
         ]
-        if not obj.material_slots:
+        effective_slots = effective_material_slot_entries(obj)
+        if not effective_slots:
             errors.append(f"Mesh '{obj.name}' has no material slots.")
             continue
         if not handoff_slots:
             continue
-        for slot_index, slot in enumerate(obj.material_slots):
-            if slot.material is None:
+        for slot_index, mat, _location in effective_slots:
+            if mat is None and not has_gpro_instance_material_source(obj):
                 errors.append(f"Mesh '{obj.name}' slot {slot_index} has no material.")
 
     for material in materials:
@@ -2270,6 +2358,54 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class UEUN_OT_reimport_unreal_textures(bpy.types.Operator):
+    bl_idname = "ue_unique_names.reimport_unreal_textures"
+    bl_label = "Reimport Unreal Textures"
+    bl_description = (
+        "Refresh the Unreal handoff JSON, then force-reimport only the referenced "
+        "texture assets in Unreal"
+    )
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        refresh_result = bpy.ops.ue_unique_names.refresh_unreal_json()
+        if "FINISHED" not in refresh_result:
+            return {"CANCELLED"}
+
+        props = context.scene.ue_unique_names
+        json_path = Path(props.last_pipeline_json_path)
+        if not json_path.is_file():
+            self.report({"ERROR"}, "No Unreal handoff JSON found for texture reimport.")
+            return {"CANCELLED"}
+
+        pipeline_dir = (Path.home() / "Documents" / "UE_Blender_Pipeline").resolve()
+        try:
+            from send2ue.dependencies.unreal import run_commands
+        except Exception as exc:
+            self.report({"ERROR"}, f"Send to Unreal remote execution unavailable: {exc}")
+            return {"CANCELLED"}
+
+        pipeline_arg = str(pipeline_dir).replace("\\", "/")
+        json_arg = str(json_path).replace("\\", "/")
+        commands = [
+            "import sys",
+            f'_d = r"{pipeline_arg}"',
+            "sys.path.append(_d) if _d not in sys.path else None",
+            "import importlib",
+            "import ue_material_setup as _p",
+            "importlib.reload(_p)",
+            f'_p.reimport_textures_from_json(r"{json_arg}")',
+        ]
+        try:
+            run_commands(commands)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Unreal texture reimport failed: {exc}")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Unreal texture reimport requested: {json_path.name}")
+        return {"FINISHED"}
+
+
 class UEUN_OT_toggle_validation_detail(bpy.types.Operator):
     bl_idname = "ue_unique_names.toggle_validation_detail"
     bl_label = "Toggle Validation Details"
@@ -2634,6 +2770,11 @@ class UEUN_PT_panel(bpy.types.Panel):
             text="Check Unreal Handoff",
             icon="CHECKMARK",
         )
+        handoff_box.operator(
+            "ue_unique_names.reimport_unreal_textures",
+            text="Reimport Unreal Textures",
+            icon="FILE_IMAGE",
+        )
         if props.last_handoff_status or props.last_handoff_log:
             log_box = handoff_box.box()
             log_box.label(
@@ -2673,6 +2814,7 @@ classes = (
     UEUN_OT_prepare_mesh_names,
     UEUN_OT_prepare_names,
     UEUN_OT_refresh_unreal_json,
+    UEUN_OT_reimport_unreal_textures,
     UEUN_OT_toggle_validation_detail,
     UEUN_OT_open_validation_sheet,
     UEUN_OT_prepare_external_asset,
