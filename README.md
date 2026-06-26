@@ -1,4 +1,4 @@
-# UE Unique Export Names
+# Unreal Handoff Validator
 
 Blender add-on for the final Blender-to-Unreal stage of the workflow built
 around PARK's [`substance-tools` fork](https://github.com/nsdoanfosan/substance-tools).
@@ -11,7 +11,7 @@ the `substance-tools` repo:
 and `pipeline_contract.json`. Treat that as the source of truth before changing
 any pipeline-facing names.
 
-The panel is in **3D Viewport > Sidebar (`N`) > UE Names**.
+The panel is in **3D Viewport > Sidebar (`N`) > Unreal Handoff**.
 
 ## Main Workflow: Substance Tools to Unreal
 
@@ -22,7 +22,7 @@ The two add-ons have separate responsibilities:
 | High/Low setup | `substance-tools` fork | Creates and manages `Baking/low` and `Baking/high` |
 | Painter project and baking | `substance-tools` + Painter startup plugin | Exports temporary FBX files, creates or updates the SPP, and controls mesh-map baking |
 | Painter texture return | `substance-tools` | Exports with `Unreal_V2`, reloads the maps, and connects them to Low materials |
-| Unreal handoff | UE Unique Export Names | Automatically mirrors Low meshes and their parent chains into `Export` and protects Painter-managed data |
+| Unreal handoff | Unreal Handoff Validator | Automatically mirrors Low meshes and their parent chains into `Export` and protects Painter-managed data |
 | Unreal mesh export | Send to Unreal | Exports the objects linked into `Export` |
 
 Normal order:
@@ -36,7 +36,7 @@ Normal order:
    the shared `texture` folder, and connect the maps to Low materials.
 6. Do not rename Low materials after the Painter round trip. Painter Texture Set
    names come from Blender material names with the leading `M_` removed.
-7. UE Unique Export Names automatically links the Low meshes and their complete
+7. Unreal Handoff Validator automatically links the Low meshes and their complete
    existing parent chains into `Export`. There is no Painter handoff button.
 8. Export with Send to Unreal. Enable **Combine > Child meshes** when an Empty
    and its children should become one Unreal asset.
@@ -47,7 +47,7 @@ protected, so the External workflow skips them.
 
 The integration uses shared Blender structure and naming; neither add-on imports
 the other. `substance-tools` owns Painter creation, baking, texture export, and
-texture reconnection. UE Unique Export Names owns automatic `Export` collection
+texture reconnection. Unreal Handoff Validator owns automatic `Export` collection
 synchronization and the protection boundary.
 
 ## Installation
@@ -55,7 +55,7 @@ synchronization and the protection boundary.
 1. Download or clone this repository.
 2. Zip the `ue_unique_export_names_addon` folder.
 3. In Blender, open **Edit > Preferences > Add-ons > Install from Disk**.
-4. Select the zip and enable **UE Unique Export Names**.
+4. Select the zip and enable **Unreal Handoff Validator**.
 
 Blender 3.6 or newer is required.
 
