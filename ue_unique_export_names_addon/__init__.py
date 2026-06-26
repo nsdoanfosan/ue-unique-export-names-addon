@@ -11,6 +11,8 @@ bl_info = {
 import bpy
 from bpy.props import BoolProperty
 
+from .gpro import unreal_handoff_materials_from_objects
+from .naming import material_texture_map, resolve_export_dir
 from .operators import (
     UEUN_OT_open_validation_sheet,
     UEUN_OT_prepare_external_asset,
@@ -21,6 +23,7 @@ from .operators import (
     UEUN_OT_restore_names,
     UEUN_OT_toggle_validation_detail,
 )
+from .pipeline_json import _json_refresh_validation_errors, write_unreal_pipeline_json
 from .painter_sync import (
     sync_painter_export_deferred,
     sync_painter_export_on_depsgraph,
@@ -28,6 +31,7 @@ from .painter_sync import (
 )
 from .properties import UEUN_PG_settings
 from .ui import UEUN_PT_panel
+from .utils import asset_prefix, validation_scope_objects
 
 classes = (
     UEUN_PG_settings,
