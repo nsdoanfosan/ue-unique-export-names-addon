@@ -15,6 +15,61 @@ from .unreal_material_json import _material_json_entry
 from .utils import clean_token, export_collection
 from .validation import export_validation_rows
 
+
+def _append_unique_name(target, seen, name):
+    name = str(name or "")
+    key = name.casefold()
+    if name and key not in seen:
+        seen.add(key)
+        target.append(name)
+
+
+def _material_instance_base_name(material_name):
+    if material_name.startswith("M_"):
+        return material_name[2:]
+    if material_name.startswith("MI_"):
+        return material_name[3:]
+    return material_name
+
+
+def _add_cleanup_material_names(target, seen, material_name):
+    _append_unique_name(target, seen, material_name)
+    base_name = _material_instance_base_name(str(material_name or ""))
+    _append_unique_name(target, seen, base_name)
+    for prefix in ("LayerBlend_", "Prop_", "Coat_"):
+        if base_name.startswith(prefix):
+            _append_unique_name(target, seen, base_name[len(prefix):])
+
+
+def _add_cleanup_texture_name(target, seen, texture):
+    file_path = str(texture.get("file", ""))
+    if file_path:
+        _append_unique_name(target, seen, Path(file_path).stem)
+        return
+    _append_unique_name(target, seen, texture.get("asset_name", ""))
+
+
+def _cleanup_json_entry(material_entries):
+    material_names = []
+    texture_names = []
+    seen_material_names = set()
+    seen_texture_names = set()
+
+    for entry in material_entries:
+        _add_cleanup_material_names(material_names, seen_material_names, entry.get("name", ""))
+        _add_cleanup_material_names(material_names, seen_material_names, entry.get("slot_name", ""))
+        for texture in entry.get("textures", []):
+            _add_cleanup_texture_name(texture_names, seen_texture_names, texture)
+        for layer in entry.get("layers", []):
+            for texture in layer.get("textures", []):
+                _add_cleanup_texture_name(texture_names, seen_texture_names, texture)
+
+    return {
+        "source_material_names": material_names,
+        "source_texture_names": texture_names,
+    }
+
+
 def _write_pipeline_sidecar(
     json_dir,
     mesh_name,
@@ -32,6 +87,7 @@ def _write_pipeline_sidecar(
         "mesh_name": mesh_name,
         "asset_prefix": prefix,
         "materials": material_entries,
+        "cleanup": _cleanup_json_entry(material_entries),
     }
     if validation is not None:
         data["validation"] = validation
