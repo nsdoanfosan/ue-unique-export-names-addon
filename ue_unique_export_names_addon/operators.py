@@ -5,6 +5,7 @@ import bpy
 from bpy.props import StringProperty
 
 from .constants import CREATED_EMPTY_PROP
+from .armature_repair import prepare_scope_armatures
 from .gpro import unreal_handoff_materials_from_objects
 from .materials import (
     external_materials_from_objects,
@@ -51,6 +52,49 @@ from .validation import (
     validation_summary,
 )
 from .validation_ui import draw_validation_wide_header, draw_validation_wide_row
+
+
+class UEUN_OT_prepare_armatures(bpy.types.Operator):
+    bl_idname = "ue_unique_names.prepare_armatures"
+    bl_label = "Prepare Armatures"
+    bl_description = (
+        "Add or repair Armature modifiers for weighted export meshes, then move "
+        "the Armature modifier to the bottom of the stack"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.ue_unique_names
+        results, skipped = prepare_scope_armatures(context, props.scope)
+        changed = [result for result in results if result.get("changed")]
+        ready = [
+            result
+            for result in results
+            if result.get("operation") in {"already_ready", "moved_existing"}
+        ]
+        skipped_other = [
+            result
+            for result in results
+            if result.get("operation") == "skipped_other_armature"
+        ]
+
+        if not results and not skipped:
+            self.report(
+                {"INFO"},
+                "No weighted export meshes needed Armature preparation.",
+            )
+            return {"FINISHED"}
+
+        message = (
+            f"Armature prep: changed {len(changed)}, ready {len(ready)}, "
+            f"skipped {len(skipped) + len(skipped_other)}."
+        )
+        if skipped_other:
+            self.report({"WARNING"}, message + " Some meshes use another armature.")
+        else:
+            self.report({"INFO"}, message)
+        return {"FINISHED"}
+
 
 class UEUN_OT_prepare_names(bpy.types.Operator):
     bl_idname = "ue_unique_names.prepare"
@@ -584,6 +628,14 @@ class UEUN_OT_prepare_external_asset(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        armature_result = bpy.ops.ue_unique_names.prepare_armatures()
+        if "FINISHED" not in armature_result:
+            self.report(
+                {"ERROR"},
+                "Armature preparation failed; external workflow stopped.",
+            )
+            return {"CANCELLED"}
+
         mesh_result = bpy.ops.ue_unique_names.prepare_mesh_names()
         if "FINISHED" not in mesh_result:
             self.report(

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Unreal Handoff Validator",
     "author": "Codex",
-    "version": (2, 8, 0),
+    "version": (2, 8, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Unreal Handoff",
     "description": "Validate Blender-to-Unreal handoff data and write the Unreal postprocess manifest.",
@@ -16,6 +16,7 @@ from .gpro import unreal_handoff_materials_from_objects
 from .naming import material_texture_map, resolve_export_dir
 from .operators import (
     UEUN_OT_open_validation_sheet,
+    UEUN_OT_prepare_armatures,
     UEUN_OT_prepare_external_asset,
     UEUN_OT_prepare_mesh_names,
     UEUN_OT_prepare_names,
@@ -42,6 +43,7 @@ __all__ = (
 
 classes = (
     UEUN_PG_settings,
+    UEUN_OT_prepare_armatures,
     UEUN_OT_prepare_mesh_names,
     UEUN_OT_prepare_names,
     UEUN_OT_refresh_unreal_json,

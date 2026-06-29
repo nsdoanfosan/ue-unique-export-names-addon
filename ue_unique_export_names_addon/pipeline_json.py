@@ -3,6 +3,7 @@ from pathlib import Path
 
 import bpy
 
+from .constants import MATERIAL_PREFIX
 from .gpro import (
     effective_material_slot_entries,
     has_gpro_instance_material_source,
@@ -25,8 +26,8 @@ def _append_unique_name(target, seen, name):
 
 
 def _material_instance_base_name(material_name):
-    if material_name.startswith("M_"):
-        return material_name[2:]
+    if material_name.startswith(MATERIAL_PREFIX):
+        return material_name[len(MATERIAL_PREFIX):]
     if material_name.startswith("MI_"):
         return material_name[3:]
     return material_name
@@ -81,7 +82,7 @@ def _write_pipeline_sidecar(
     transfer_sources=None,
 ):
     data = {
-        "schema_version": 2,
+        "schema_version": 3,
         "material_pipeline": "surface_layers",
         "material_master": "prop",
         "mesh_name": mesh_name,
@@ -303,9 +304,9 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
     for material in materials:
         usage = material_usage_text(material, material_usage)
         _validate_clean_name("Material", material.name, errors)
-        if not clean_token(material.name).startswith("M_"):
+        if not clean_token(material.name).startswith(MATERIAL_PREFIX):
             errors.append(
-                f"Material '{material.name}' must use the M_ prefix. Used by: {usage}."
+                f"Material '{material.name}' must use the {MATERIAL_PREFIX} prefix. Used by: {usage}."
             )
 
         textures = texture_map.get(material, {})

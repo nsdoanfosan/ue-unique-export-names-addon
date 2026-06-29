@@ -8,6 +8,8 @@ from .constants import (
     BACKUP_FILEPATH_PROP,
     BACKUP_FILEPATH_RAW_PROP,
     BACKUP_PROP,
+    MATERIAL_PREFIX,
+    TEXTURE_PREFIX,
     ROLE_BY_BSDF_INPUT,
     ROLE_PRIORITY,
 )
@@ -118,8 +120,68 @@ def find_image_node_from_socket(socket, visited=None):
     return None
 
 
+def _image_handoff_token(image):
+    raw_path = (getattr(image, "filepath_raw", "") or getattr(image, "filepath", "") or "")
+    if raw_path:
+        return clean_token(Path(raw_path.replace("\\", "/")).stem).lower()
+    return clean_token(getattr(image, "name", "")).lower()
+
+
+def image_is_excluded_handoff_texture(image):
+    token = _image_handoff_token(image)
+    return token.endswith(("_color_alpha", "_color_baking"))
+
+
+def image_matches_handoff_role(image, role):
+    token = _image_handoff_token(image)
+    if image_is_excluded_handoff_texture(image):
+        return False
+    if token.startswith(TEXTURE_PREFIX.lower()):
+        token = token[len(TEXTURE_PREFIX):]
+    suffixes_by_role = {
+        "BaseColor": ("_color",),
+        "MetallicRoughness": ("_extra",),
+        "Normal": ("_normal",),
+        "Emissive": ("_emissive",),
+        "Height": ("_height",),
+        "SheenColor": ("_sheencolor",),
+        "SheenOpacity": ("_sheenopacity",),
+        "SheenRoughness": ("_sheenroughness",),
+    }
+    suffixes = suffixes_by_role.get(role)
+    return bool(suffixes and token.endswith(suffixes))
+
+
+def find_canonical_handoff_image_for_role(mat, role):
+    if not mat or not mat.node_tree:
+        return None
+    for node in mat.node_tree.nodes:
+        if node.type != "TEX_IMAGE" or not node.image or node.image.library:
+            continue
+        if image_matches_handoff_role(node.image, role):
+            return node.image
+    return None
+
+
+def ensure_required_handoff_roles(mat, textures):
+    for role in ("Height",):
+        if textures.get(role):
+            continue
+        image = find_canonical_handoff_image_for_role(mat, role)
+        if image is not None and not image.library and not image_is_excluded_handoff_texture(image):
+            textures[role] = image
+
+
 def fallback_role_from_node(node):
-    text = clean_token(f"{node.label}_{node.name}").lower()
+    image = getattr(node, "image", None)
+    image_name = getattr(image, "name", "") if image is not None else ""
+    text = clean_token(f"{node.label}_{node.name}_{image_name}").lower()
+    if "sheen" in text and "color" in text:
+        return "SheenColor"
+    if "sheen" in text and ("opacity" in text or "weight" in text):
+        return "SheenOpacity"
+    if "sheen" in text and "rough" in text:
+        return "SheenRoughness"
     if "base" in text or "albedo" in text or "diffuse" in text or "color" in text:
         return "BaseColor"
     if "extra" in text:
@@ -141,6 +203,31 @@ def fallback_role_from_node(node):
     return "Texture"
 
 
+def image_node_has_output_links(node):
+    return any(output.links for output in getattr(node, "outputs", []))
+
+
+def image_node_is_canonical_handoff_texture(node):
+    image = getattr(node, "image", None)
+    if image is None:
+        return False
+    lowered = _image_handoff_token(image)
+    if lowered.startswith(TEXTURE_PREFIX.lower()):
+        lowered = lowered[len(TEXTURE_PREFIX):]
+    if image_is_excluded_handoff_texture(image):
+        return False
+    return lowered.endswith((
+        "_color",
+        "_extra",
+        "_normal",
+        "_emissive",
+        "_height",
+        "_sheencolor",
+        "_sheenopacity",
+        "_sheenroughness",
+    ))
+
+
 def material_texture_map(materials):
     mapping = {}
     for mat in materials:
@@ -155,10 +242,23 @@ def material_texture_map(materials):
                     socket = node.inputs.get(input_name)
                     image_node = find_image_node_from_socket(socket)
                     if image_node and role not in textures:
-                        textures[role] = image_node.image
+                        image = image_node.image
+                        if image_is_excluded_handoff_texture(image):
+                            image = find_canonical_handoff_image_for_role(mat, role)
+                        if image:
+                            textures[role] = image
 
         for node in mat.node_tree.nodes:
-            if node.type == "TEX_IMAGE" and node.image and not node.image.library:
+            if (
+                node.type == "TEX_IMAGE"
+                and node.image
+                and not node.image.library
+                and not image_is_excluded_handoff_texture(node.image)
+                and (
+                    image_node_has_output_links(node)
+                    or image_node_is_canonical_handoff_texture(node)
+                )
+            ):
                 role = fallback_role_from_node(node)
                 textures.setdefault(role, node.image)
 
@@ -170,6 +270,8 @@ def material_texture_map(materials):
             textures["MetallicRoughness"] = textures["Metallic"]
             del textures["Metallic"]
             del textures["Roughness"]
+
+        ensure_required_handoff_roles(mat, textures)
 
         used_images = set()
         deduped = {}
@@ -292,13 +394,17 @@ def cleanup_export_files(export_dir, prefix, preserve_paths=None):
         Path(path).resolve()
         for path in (preserve_paths or ())
     }
-    for path in export_dir.glob(f"T_{prefix}_*"):
+    for path in export_dir.glob(f"{TEXTURE_PREFIX}{prefix}_*"):
         if path.is_file() and path.resolve() not in preserve_paths:
             path.unlink()
 
 
 def material_name_for(prefix, index, material_count):
-    return f"M_{prefix}" if material_count == 1 else f"M_{prefix}_{index + 1:02d}"
+    return (
+        f"{MATERIAL_PREFIX}{prefix}"
+        if material_count == 1
+        else f"{MATERIAL_PREFIX}{prefix}_{index + 1:02d}"
+    )
 
 
 def mesh_name_for(prefix, index, object_count):
@@ -386,8 +492,8 @@ def export_naming_units(context, scope, objects):
 
 def material_instance_name(material_name):
     clean_name = clean_token(material_name)
-    if clean_name.startswith("M_"):
-        return f"MI_{clean_name[2:]}"
+    if clean_name.startswith(MATERIAL_PREFIX):
+        return f"MI_{clean_name[len(MATERIAL_PREFIX):]}"
     if clean_name.startswith("MI_"):
         return clean_name
     return f"MI_{clean_name}"
@@ -395,12 +501,12 @@ def material_instance_name(material_name):
 
 def texture_set_name(material):
     name = clean_token(material.name)
-    return name[2:] if name.startswith("M_") else name
+    return name[len(MATERIAL_PREFIX):] if name.startswith(MATERIAL_PREFIX) else name
 
 
 def texture_name_for(material, role, index, count):
     output_role = PAINTER_ROLE_NAMES.get(role, role)
-    name = f"T_{texture_set_name(material)}_{output_role}"
+    name = f"{TEXTURE_PREFIX}{texture_set_name(material)}_{output_role}"
     if count > 1:
         name = f"{name}_{index + 1:02d}"
     return name
@@ -409,8 +515,12 @@ def texture_name_for(material, role, index, count):
 def texture_name_for_material_name(material_name, role):
     output_role = PAINTER_ROLE_NAMES.get(role, role)
     clean_name = clean_token(material_name)
-    texture_set = clean_name[2:] if clean_name.startswith("M_") else clean_name
-    return f"T_{texture_set}_{output_role}"
+    texture_set = (
+        clean_name[len(MATERIAL_PREFIX):]
+        if clean_name.startswith(MATERIAL_PREFIX)
+        else clean_name
+    )
+    return f"{TEXTURE_PREFIX}{texture_set}_{output_role}"
 
 
 def write_manifest(context, prefix, objects, materials, texture_map, export_dir):

@@ -2,6 +2,8 @@ from pathlib import Path
 
 import bpy
 
+from .armature_repair import armature_validation_warnings
+from .constants import MATERIAL_PREFIX
 from .gpro import (
     effective_material_slot_entries,
     has_gpro_instance_material_source,
@@ -70,12 +72,13 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
 
         if (transfer_shape_keys_enabled(obj) or transfer_weights_enabled(obj)) and not transfer_source_for_object(obj):
             warnings.append("Transfer source not set")
+        warnings.extend(armature_validation_warnings(context, obj))
 
         for material in handoff_materials:
             if clean_token(material.name) != material.name:
                 errors.append(f"Material renames to {clean_token(material.name)}")
-            if not clean_token(material.name).startswith("M_"):
-                errors.append(f"{material.name} has no M_ prefix")
+            if not clean_token(material.name).startswith(MATERIAL_PREFIX):
+                errors.append(f"{material.name} has no {MATERIAL_PREFIX} prefix")
             textures = texture_map.get(material, {})
             if not textures:
                 continue

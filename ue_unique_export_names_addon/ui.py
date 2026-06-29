@@ -56,6 +56,11 @@ class UEUN_PT_panel(bpy.types.Panel):
             json_texture_map,
         )
         handoff_box.operator(
+            "ue_unique_names.prepare_armatures",
+            text="Prepare Armatures",
+            icon="OUTLINER_OB_ARMATURE",
+        )
+        handoff_box.operator(
             "ue_unique_names.refresh_unreal_json",
             text="Check Unreal Handoff",
             icon="CHECKMARK",

@@ -3,7 +3,11 @@ from pathlib import Path
 
 import bpy
 
-from .constants import BAKING_LOW_COLLECTION_NAME, EXPORT_COLLECTION_NAME
+from .constants import (
+    BAKING_LOW_COLLECTION_NAME,
+    BAKING_ROOT_COLLECTION_NAME,
+    EXPORT_COLLECTION_NAME,
+)
 
 def clean_token(value):
     value = str(value or "").strip()
@@ -35,7 +39,7 @@ def ensure_export_collection(context):
 
 
 def baking_low_collection():
-    baking = bpy.data.collections.get("Baking")
+    baking = bpy.data.collections.get(BAKING_ROOT_COLLECTION_NAME)
     if baking is not None:
         for child in baking.children:
             if child.name == BAKING_LOW_COLLECTION_NAME:
