@@ -36,6 +36,10 @@ def is_layerblend_material_name(material_name):
     return clean_token(material_name).lower().startswith("m_layerblend_")
 
 
+def is_hair_material_name(material_name):
+    return clean_token(material_name).lower().startswith("m_ht_")
+
+
 def _material_instance_base_name(material_name):
     name = clean_token(material_name)
     if name.startswith("M_"):
@@ -198,6 +202,8 @@ def _material_layer_json_entries(mat, texture_map):
 
 def master_preset_for_material(mat):
     name = clean_token(mat.name).lower()
+    if is_hair_material_name(mat.name):
+        return "hair"
     if is_layerblend_material_name(mat.name):
         return "layer"
     if "cloth" in name or "clothes" in name:
@@ -206,20 +212,25 @@ def master_preset_for_material(mat):
 
 
 def _material_json_entry(mat, slot_index, texture_map):
+    is_hair = is_hair_material_name(mat.name)
     textures = []
-    for role, image in texture_map.get(mat, {}).items():
-        textures.append(_texture_json_entry(role, image))
+    if not is_hair:
+        for role, image in texture_map.get(mat, {}).items():
+            textures.append(_texture_json_entry(role, image))
     entry = {
         "name": mat.name,
         "slot_name": mat.name,
         "slot_index": slot_index,
         "translucent": is_translucent_material(mat),
         "textures": textures,
-        "layers": _material_layer_json_entries(mat, texture_map),
+        "layers": [] if is_hair else _material_layer_json_entries(mat, texture_map),
     }
     master_preset = master_preset_for_material(mat)
     if master_preset:
         entry["master_preset"] = master_preset
+        if master_preset == "hair":
+            entry["material_instance_name"] = f"MI_{_material_instance_base_name(mat.name)}"
+            entry["create_if_missing"] = False
         material_layer = material_layer_entry_for_material(mat, master_preset)
         if material_layer:
             entry["material_layer"] = material_layer
