@@ -104,14 +104,21 @@ def is_unreal_handoff_material(mat):
     return not clean_token(mat.name).upper().startswith("HT_")
 
 
+def unreal_handoff_material_slot_entries(obj):
+    return [
+        (slot_index, mat, location)
+        for slot_index, mat, location in effective_material_slot_entries(obj)
+        if mat and is_unreal_handoff_material(mat)
+    ]
+
+
 def unreal_handoff_materials_from_objects(objects):
     materials = []
     seen = set()
     for obj in objects:
-        for _slot_index, mat, _location in effective_material_slot_entries(obj):
+        for _slot_index, mat, _location in unreal_handoff_material_slot_entries(obj):
             if (
                 mat
-                and is_unreal_handoff_material(mat)
                 and mat.name not in seen
             ):
                 materials.append(mat)
@@ -122,7 +129,7 @@ def unreal_handoff_materials_from_objects(objects):
 def material_usage_lookup(objects):
     usage = {}
     for obj in objects:
-        for _slot_index, mat, location in effective_material_slot_entries(obj):
+        for _slot_index, mat, location in unreal_handoff_material_slot_entries(obj):
             if mat is None:
                 continue
             usage.setdefault(mat, []).append(location)

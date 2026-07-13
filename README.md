@@ -108,17 +108,23 @@ Steps:
 1. Choose **Write Texture Files** to produce PNG files, or **Rename Paths Only**
    to change Blender image path strings.
 2. Enable **Write Unreal Manifest** when Unreal postprocess metadata is needed.
-3. Press **Prepare External Asset**.
-4. Review the generated files and save the `.blend` file manually.
+3. Select the mesh objects that need mesh/data renaming.
+4. Press **Rename Selected Meshes**, review the preview, then confirm with OK.
+5. Press **Prepare External Textures** when material/texture files and Unreal
+   metadata need updating.
+6. Review the generated files and save the `.blend` file manually.
 
-The single button runs in this order:
+Mesh renaming is intentionally not automatic. It only runs for selected mesh
+objects after the preview dialog is confirmed.
 
-1. rename mesh objects and mesh data;
+The external texture button runs in this order:
+
+1. prepare armature modifiers;
 2. normalize material and texture names;
 3. write textures and Unreal metadata.
 
-This prevents texture and sidecar names from being generated from obsolete mesh
-names.
+Run the selected mesh rename first when texture or sidecar names must reflect
+new mesh naming.
 
 Naming rules:
 

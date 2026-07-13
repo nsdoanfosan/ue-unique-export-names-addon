@@ -2,9 +2,9 @@ from pathlib import Path
 
 import bpy
 
-from .gpro import unreal_handoff_materials_from_objects
+from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
 from .naming import material_texture_map
-from .utils import validation_scope_objects
+from .utils import hair_tool_asset_groups, validation_scope_objects
 from .validation_ui import (
     draw_export_transfer_source,
     draw_export_validation_table,
@@ -41,11 +41,21 @@ class UEUN_PT_panel(bpy.types.Panel):
         handoff_box.prop(props, "scope")
         handoff_box.prop(props, "texture_export_dir")
         json_objects = validation_scope_objects(context, props.scope)
+        hair_assets = hair_tool_asset_groups(context, props.scope)
         handoff_box.label(
-            text=f"Export targets {len(json_objects)}",
-            icon="INFO" if json_objects else "ERROR",
+            text=f"Export targets {len(json_objects) + len(hair_assets)}",
+            icon="INFO" if json_objects or hair_assets else "ERROR",
         )
         json_materials = unreal_handoff_materials_from_objects(json_objects)
+        seen_materials = {material.name for material in json_materials}
+        for asset in hair_assets:
+            for material in asset["materials"]:
+                if (
+                    is_unreal_handoff_material(material)
+                    and material.name not in seen_materials
+                ):
+                    json_materials.append(material)
+                    seen_materials.add(material.name)
         json_texture_map = material_texture_map(json_materials)
         draw_export_validation_table(
             handoff_box,
@@ -93,8 +103,13 @@ class UEUN_PT_panel(bpy.types.Panel):
             external_box.prop(props, "rename_image_paths")
         draw_external_workflow_preview(external_box, context, props)
         external_box.operator(
+            "ue_unique_names.prepare_mesh_names",
+            text="Rename Selected Meshes",
+            icon="VIEWZOOM",
+        )
+        external_box.operator(
             "ue_unique_names.prepare_external_asset",
-            text="Prepare External Asset",
+            text="Prepare External Textures",
             icon="CHECKMARK",
         )
         if props.last_manifest_path:

@@ -7,14 +7,15 @@ from .constants import MATERIAL_PREFIX
 from .gpro import (
     effective_material_slot_entries,
     has_gpro_instance_material_source,
-    is_unreal_handoff_material,
     material_usage_lookup,
     material_usage_text,
+    unreal_handoff_material_slot_entries,
 )
 from .transfer import transfer_postprocess_entry
 from .unreal_material_json import _material_json_entry
 from .utils import clean_token, export_collection
 from .validation import export_validation_rows
+from .validation import _hair_asset_validation_row
 
 
 def _append_unique_name(target, seen, name):
@@ -111,7 +112,9 @@ def write_unreal_pipeline_json(
     texture_map,
     json_dir,
     combined_only=False,
+    hair_assets=None,
 ):
+    hair_assets = list(hair_assets or [])
     json_dir.mkdir(parents=True, exist_ok=True)
     json_paths = []
     object_names = {clean_token(obj.name) for obj in objects}
@@ -120,11 +123,21 @@ def write_unreal_pipeline_json(
         objects=objects,
         materials=materials,
         texture_map=texture_map,
+        hair_assets=hair_assets,
     )
     validation_by_object_name = {
         row["object_name"]: row
         for row in validation_rows
     }
+    validation_by_asset_unit = {
+        asset["asset_name"]: _hair_asset_validation_row(asset, texture_map)
+        for asset in hair_assets
+    }
+    hair_assets_by_name = {
+        clean_token(asset["asset_name"]): asset
+        for asset in hair_assets
+    }
+    written_target_names = set()
 
     if not combined_only:
         # Per standalone mesh-object sidecar. Child meshes under an Empty export
@@ -135,10 +148,9 @@ def write_unreal_pipeline_json(
             mesh_name = clean_token(obj.name)
             entries = []
             seen_materials = set()
-            for slot_index, mat, _location in effective_material_slot_entries(obj):
+            for slot_index, mat, _location in unreal_handoff_material_slot_entries(obj):
                 if (
                     not mat
-                    or not is_unreal_handoff_material(mat)
                     or mat in seen_materials
                 ):
                     continue
@@ -154,6 +166,7 @@ def write_unreal_pipeline_json(
                     transfer_source=transfer_postprocess_entry(obj),
                 )
             )
+            written_target_names.add(mesh_name)
 
     # 2) Per EMPTY-parent sidecar. Send to Unreal "Combine > Child meshes" merges an empty's child
     #    meshes into ONE asset named after the empty (combine_assets.py pre_mesh_export), so without
@@ -179,10 +192,9 @@ def write_unreal_pipeline_json(
         seen_materials = set()
         slot_index = 0
         for obj in children_by_empty[empty.name]:
-            for _source_slot_index, mat, _location in effective_material_slot_entries(obj):
+            for _source_slot_index, mat, _location in unreal_handoff_material_slot_entries(obj):
                 if (
                     not mat
-                    or not is_unreal_handoff_material(mat)
                     or mat in seen_materials
                 ):
                     continue
@@ -195,6 +207,17 @@ def write_unreal_pipeline_json(
                 for obj in children_by_empty[empty.name]
                 if obj.name in validation_by_object_name
             ]
+            hair_asset = hair_assets_by_name.get(empty_name)
+            if hair_asset:
+                for material in hair_asset["materials"]:
+                    if material in seen_materials:
+                        continue
+                    seen_materials.add(material)
+                    entries.append(_material_json_entry(material, slot_index, texture_map))
+                    slot_index += 1
+                hair_validation = validation_by_asset_unit.get(hair_asset["asset_name"])
+                if hair_validation:
+                    child_validation.append(hair_validation)
             json_paths.append(
                 _write_pipeline_sidecar(
                     json_dir,
@@ -208,16 +231,39 @@ def write_unreal_pipeline_json(
                     ],
                 )
             )
+            written_target_names.add(empty_name)
+
+    if not combined_only:
+        for asset in hair_assets:
+            mesh_name = clean_token(asset["asset_name"])
+            if mesh_name in written_target_names:
+                continue
+            entries = [
+                _material_json_entry(material, slot_index, texture_map)
+                for slot_index, material in enumerate(asset["materials"])
+            ]
+            json_paths.append(
+                _write_pipeline_sidecar(
+                    json_dir,
+                    mesh_name,
+                    prefix,
+                    entries,
+                    validation=validation_by_asset_unit.get(asset["asset_name"]),
+                )
+            )
+            written_target_names.add(mesh_name)
 
     if json_paths:
-        cleanup_stale_pipeline_sidecars(json_dir, objects, json_paths)
+        cleanup_stale_pipeline_sidecars(json_dir, objects, json_paths, hair_assets=hair_assets)
         context.scene.ue_unique_names.last_pipeline_json_path = str(json_paths[-1])
     return json_paths
 
 
-def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths):
+def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths, hair_assets=None):
+    hair_assets = list(hair_assets or [])
     keep = {Path(path).resolve() for path in keep_paths}
     candidate_names = {clean_token(obj.name) for obj in objects}
+    candidate_names.update(clean_token(asset["asset_name"]) for asset in hair_assets)
     for obj in objects:
         parent = obj.parent
         if parent and parent.type == "EMPTY":
@@ -232,7 +278,8 @@ def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths):
             pass
 
 
-def _json_target_names(objects, combined_only=False):
+def _json_target_names(objects, combined_only=False, hair_assets=None):
+    hair_assets = list(hair_assets or [])
     names = []
     if not combined_only:
         names.extend(
@@ -256,6 +303,14 @@ def _json_target_names(objects, combined_only=False):
         if clean_token(empty.name) in object_names:
             continue
         names.append(empty.name)
+    existing_names = {clean_token(name) for name in names}
+    if not combined_only:
+        for asset in hair_assets:
+            clean_name = clean_token(asset["asset_name"])
+            if clean_name in existing_names:
+                continue
+            names.append(asset["asset_name"])
+            existing_names.add(clean_name)
     return names
 
 
@@ -265,18 +320,24 @@ def _validate_clean_name(label, name, errors):
         errors.append(f"{label} '{name}' would be written as '{clean}'. Rename it explicitly first.")
 
 
-def _json_refresh_validation_errors(context, props, objects, materials, texture_map):
+def _json_refresh_validation_errors(context, props, objects, materials, texture_map, hair_assets=None):
+    hair_assets = list(hair_assets or [])
     errors = []
     material_usage = material_usage_lookup(objects)
+    for asset in hair_assets:
+        for material in asset["materials"]:
+            material_usage.setdefault(material, []).append(
+                f"{asset['asset_name']} Hair Tool profile"
+            )
     if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
         errors.append("Export collection does not exist.")
-    if not objects:
+    if not objects and not hair_assets:
         errors.append("No export objects in the selected JSON scope.")
         return errors
     if not materials:
         errors.append("No materials found in the selected JSON scope.")
 
-    target_names = _json_target_names(objects)
+    target_names = _json_target_names(objects, hair_assets=hair_assets)
     for name in target_names:
         _validate_clean_name("JSON target", name, errors)
     duplicated_targets = sorted(
@@ -288,8 +349,7 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
     for obj in objects:
         handoff_slots = [
             (slot_index, mat)
-            for slot_index, mat, _location in effective_material_slot_entries(obj)
-            if mat and is_unreal_handoff_material(mat)
+            for slot_index, mat, _location in unreal_handoff_material_slot_entries(obj)
         ]
         effective_slots = effective_material_slot_entries(obj)
         if not effective_slots:

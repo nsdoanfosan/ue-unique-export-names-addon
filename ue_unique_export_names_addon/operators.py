@@ -2,11 +2,12 @@ from datetime import datetime
 from pathlib import Path
 
 import bpy
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 
+from . import api as handoff_api
 from .constants import CREATED_EMPTY_PROP
 from .armature_repair import prepare_scope_armatures
-from .gpro import unreal_handoff_materials_from_objects
+from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
 from .materials import (
     external_materials_from_objects,
     mutation_safe_mesh_objects,
@@ -14,6 +15,7 @@ from .materials import (
 )
 from .naming import (
     cleanup_export_files,
+    external_workflow_preview_rows,
     export_naming_units,
     image_disk_path,
     image_is_writable,
@@ -41,7 +43,7 @@ from .pipeline_json import (
     write_unreal_pipeline_json,
 )
 from .spreadsheet import open_validation_spreadsheet_window
-from .utils import asset_prefix, export_collection, validation_scope_objects
+from .utils import asset_prefix, export_collection, hair_tool_asset_groups, validation_scope_objects
 from .validation import (
     export_validation_rows,
     grouped_validation_rows,
@@ -52,6 +54,21 @@ from .validation import (
     validation_summary,
 )
 from .validation_ui import draw_validation_wide_header, draw_validation_wide_row
+
+
+def _handoff_materials_with_hair(context, props, objects):
+    hair_assets = hair_tool_asset_groups(context, props.scope)
+    materials = unreal_handoff_materials_from_objects(objects)
+    seen_materials = {material.name for material in materials}
+    for asset in hair_assets:
+        for material in asset["materials"]:
+            if (
+                is_unreal_handoff_material(material)
+                and material.name not in seen_materials
+            ):
+                materials.append(material)
+                seen_materials.add(material.name)
+    return materials, hair_assets
 
 
 class UEUN_OT_prepare_armatures(bpy.types.Operator):
@@ -234,7 +251,16 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
         pipeline_json_paths = []
         if props.write_manifest and props.texture_handling == "WRITE_FILES":
             manifest_path = write_manifest(context, prefix, objects, materials, texture_map, export_dir)
-            pipeline_json_paths = write_unreal_pipeline_json(context, prefix, objects, materials, texture_map, export_dir)
+            hair_assets = hair_tool_asset_groups(context, props.scope)
+            pipeline_json_paths = write_unreal_pipeline_json(
+                context,
+                prefix,
+                objects,
+                materials,
+                texture_map,
+                export_dir,
+                hair_assets=hair_assets,
+            )
 
         self.report(
             {"INFO"},
@@ -266,18 +292,8 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.ue_unique_names
-        prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
-        objects = validation_scope_objects(context, props.scope)
-        materials = unreal_handoff_materials_from_objects(objects)
-        texture_map = material_texture_map(materials)
-
-        errors = _json_refresh_validation_errors(
-            context,
-            props,
-            objects,
-            materials,
-            texture_map,
-        )
+        data = handoff_api.refresh_handoff_json(context)
+        errors = data.get("errors", [])
         if errors:
             props.last_handoff_status = f"Blocked: {len(errors)} issue(s), JSON not updated"
             visible_errors = [
@@ -289,35 +305,22 @@ class UEUN_OT_refresh_unreal_json(bpy.types.Operator):
             _report_validation_errors(self, errors)
             return {"CANCELLED"}
 
-        export_dir = resolve_export_dir(props.texture_export_dir)
-        try:
-            json_paths = write_unreal_pipeline_json(
-                context,
-                prefix,
-                objects,
-                materials,
-                texture_map,
-                export_dir,
-            )
-        except OSError as error:
-            props.last_handoff_status = "Failed"
-            props.last_handoff_log = f"JSON refresh failed: {error}"
-            self.report({"ERROR"}, f"JSON refresh failed: {error}")
-            return {"CANCELLED"}
-
+        json_paths = data.get("json_paths", [])
         if not json_paths:
             props.last_handoff_status = "Failed"
             props.last_handoff_log = "JSON refresh produced no files."
             self.report({"ERROR"}, "JSON refresh produced no files.")
             return {"CANCELLED"}
 
+        export_dir = data["export_dir"]
         refreshed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows = export_validation_rows(
             context,
             props=props,
-            objects=objects,
-            materials=materials,
-            texture_map=texture_map,
+            objects=data["objects"],
+            materials=data["materials"],
+            texture_map=data["texture_map"],
+            hair_assets=data["hair_assets"],
         )
         pipeline_counts = validation_pipeline_summary(rows)
         props.last_handoff_status = f"Ready: JSON refreshed {refreshed_at}"
@@ -520,17 +523,66 @@ class UEUN_OT_restore_names(bpy.types.Operator):
 
 class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
     bl_idname = "ue_unique_names.prepare_mesh_names"
-    bl_label = "Prepare Mesh Names"
-    bl_description = "Rename mesh objects and mesh data from the configured prefix"
+    bl_label = "Rename Selected Meshes"
+    bl_description = (
+        "Preview and rename only the selected mesh objects and their mesh data "
+        "from the configured prefix"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
+    confirmed: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        self.confirmed = True
+        return context.window_manager.invoke_props_dialog(self, width=560)
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.ue_unique_names
+        objects, skipped_objects, _protected = mutation_safe_mesh_objects(
+            context, "SELECTED"
+        )
+        rows = external_workflow_preview_rows(context, props, objects, scope="SELECTED")
+
+        layout.label(text="Selected mesh rename preview", icon="VIEWZOOM")
+        layout.label(
+            text=f"Targets {len(objects)}",
+            icon="INFO" if objects else "ERROR",
+        )
+        if skipped_objects:
+            layout.label(
+                text=f"Protected Painter meshes skipped {len(skipped_objects)}",
+                icon="INFO",
+            )
+        if not rows:
+            layout.label(text="Select mesh objects before running this.", icon="ERROR")
+            return
+
+        preview = layout.column(align=True)
+        for row_data in rows[:12]:
+            preview.label(text=row_data["object"], icon="OUTLINER_OB_MESH")
+            preview.label(text=f"  -> {row_data['planned']}", icon="CHECKMARK")
+            if row_data.get("group"):
+                preview.label(text=f"  in {row_data['group']}", icon="EMPTY_AXIS")
+        if len(rows) > 12:
+            preview.label(text=f"+{len(rows) - 12} more", icon="INFO")
+
     def execute(self, context):
+        if not self.confirmed:
+            self.report(
+                {"WARNING"},
+                "Use the Rename Selected Meshes button and confirm the preview first.",
+            )
+            return {"CANCELLED"}
+
         props = context.scene.ue_unique_names
         prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
         objects, skipped_objects, protected = mutation_safe_mesh_objects(
-            context, props.scope
+            context, "SELECTED"
         )
         if not objects:
+            self.report({"WARNING"}, "Select one or more mesh objects to rename.")
+            return {"CANCELLED"}
             if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
                 self.report(
                     {"WARNING"},
@@ -541,7 +593,7 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
                 self.report({"WARNING"}, "대상 메쉬가 없습니다 (no mesh objects found).")
             return {"CANCELLED"}
 
-        units = export_naming_units(context, props.scope, objects)
+        units = export_naming_units(context, "SELECTED", objects)
         protected_meshes = protected["meshes"]
         roots = [
             unit["root"]
@@ -606,6 +658,14 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
                     )
                 renamed_meshes += 1
 
+        message = (
+            f"Done: selected units {len(units)}; mesh names {renamed_meshes} renamed"
+        )
+        if skipped_objects:
+            message += f"; protected Painter meshes skipped {len(skipped_objects)}"
+        self.report({"INFO"}, message + ". (.blend file not saved)")
+        return {"FINISHED"}
+
         self.report(
             {"INFO"},
             f"완료 (done): Export 단위 {len(units)}개 · 메쉬 이름 {renamed_meshes}개 정리"
@@ -617,13 +677,12 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
         )
         return {"FINISHED"}
 
-
 class UEUN_OT_prepare_external_asset(bpy.types.Operator):
     bl_idname = "ue_unique_names.prepare_external_asset"
-    bl_label = "Prepare External Asset"
+    bl_label = "Prepare External Textures"
     bl_description = (
-        "Rename mesh objects/data first, then normalize external material and "
-        "texture names and write Unreal files"
+        "Prepare armatures, external material and texture names, and Unreal files. "
+        "Mesh renaming is a separate preview-confirmed selected-object step"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -636,7 +695,7 @@ class UEUN_OT_prepare_external_asset(bpy.types.Operator):
             )
             return {"CANCELLED"}
 
-        mesh_result = bpy.ops.ue_unique_names.prepare_mesh_names()
+        mesh_result = {"FINISHED"}
         if "FINISHED" not in mesh_result:
             self.report(
                 {"ERROR"},
@@ -649,11 +708,24 @@ class UEUN_OT_prepare_external_asset(bpy.types.Operator):
         if "FINISHED" not in texture_result:
             self.report(
                 {"ERROR"},
+                "External texture preparation failed. Mesh names were not changed "
+                "by this operator.",
+            )
+            return {"CANCELLED"}
+            self.report(
+                {"ERROR"},
                 "메쉬 이름은 변경됐지만 텍스처 준비에 실패했습니다. "
                 "필요하면 Restore Original Names로 되돌리세요 "
                 "(mesh names changed, texture preparation failed).",
             )
             return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            "External texture workflow complete. Mesh renaming remains a separate "
+            "preview-confirmed step.",
+        )
+        return {"FINISHED"}
 
         self.report(
             {"INFO"},

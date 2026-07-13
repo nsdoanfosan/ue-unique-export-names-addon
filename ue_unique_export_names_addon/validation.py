@@ -7,7 +7,7 @@ from .constants import MATERIAL_PREFIX
 from .gpro import (
     effective_material_slot_entries,
     has_gpro_instance_material_source,
-    is_unreal_handoff_material,
+    unreal_handoff_material_slot_entries,
     unreal_handoff_materials_from_objects,
 )
 from .materials import linked_painter_low_objects, protected_painter_data
@@ -26,26 +26,147 @@ from .transfer import (
 )
 from .utils import clean_token, export_collection, is_hair_tool_object, parent_chain, validation_scope_objects
 
-def export_validation_rows(context, props=None, objects=None, materials=None, texture_map=None):
+def _hair_asset_validation_row(asset, texture_map):
+    asset_name = asset["asset_name"]
+    asset_parent = asset["asset_parent"]
+    generated_mesh_name = f"{asset_name}__S2U_HAIR"
+    sources = asset["sources"]
+    handoff_materials = list(asset["materials"])
+    texture_roles = texture_roles_for_materials(handoff_materials, texture_map)
+    errors = []
+    warnings = []
+
+    if clean_token(asset_name) != asset_name:
+        errors.append(f"JSON name becomes {clean_token(asset_name)}")
+    if not handoff_materials:
+        errors.append("No Hair Tool profile material")
+
+    for material in handoff_materials:
+        if clean_token(material.name) != material.name:
+            errors.append(f"Material renames to {clean_token(material.name)}")
+        if not clean_token(material.name).startswith(MATERIAL_PREFIX):
+            errors.append(f"{material.name} has no {MATERIAL_PREFIX} prefix")
+        textures = texture_map.get(material, {})
+        for role, image in textures.items():
+            source_value = image.filepath_raw or image.filepath
+            if not source_value:
+                errors.append(f"{image.name} ({role}) has no file path")
+                continue
+            if not Path(bpy.path.abspath(source_value)).is_file():
+                errors.append(f"{image.name} ({role}) file missing")
+
+    transfer_source = ""
+    transfer_shape_keys = False
+    transfer_weights = False
+    for source in sources:
+        transfer_shape_keys = transfer_shape_keys or transfer_shape_keys_enabled(source)
+        transfer_weights = transfer_weights or transfer_weights_enabled(source)
+        if not transfer_source:
+            transfer_source = transfer_source_name_for_object(source)
+
+    status = "ERROR" if errors else "WARN" if warnings else "OK"
+    return {
+        "object_name": generated_mesh_name,
+        "mesh_data_name": generated_mesh_name,
+        "asset_unit": asset_name,
+        "json_name": clean_token(asset_name),
+        "parent_chain": [parent.name for parent in parent_chain(asset_parent)],
+        "armatures": unique_ordered_names(
+            name for source in sources for name in armature_names_for_object(source)
+        ),
+        "transfer_source": transfer_source,
+        "transfer_shape_keys": transfer_shape_keys,
+        "transfer_weights": transfer_weights,
+        "export_kind": "Hair",
+        "export_action": "Hair bake",
+        "export_details": [
+            f"Hair Tool final asset: {len(sources)} source object(s) bake to {asset_name}__S2U_HAIR.",
+            "Profile materials are used for handoff; source guide mesh material slots are ignored.",
+        ],
+        "material_slots": [material.name for material in handoff_materials],
+        "handoff_materials": [material.name for material in handoff_materials],
+        "texture_roles": texture_roles,
+        "painter_protected": False,
+        "painter_low": False,
+        "status": status,
+        "errors": unique_ordered_names(errors),
+        "warnings": unique_ordered_names(warnings),
+        "json_ready": status != "ERROR",
+    }
+
+
+def _hair_source_validation_row(asset, source):
+    asset_name = asset["asset_name"]
+    errors = []
+    warnings = []
+
+    if clean_token(source.name) != source.name:
+        errors.append(f"JSON name becomes {clean_token(source.name)}")
+
+    profile_materials = []
+    seen = set()
+    for material in asset["materials"]:
+        if material.name in seen:
+            continue
+        profile_materials.append(material)
+        seen.add(material.name)
+
+    if not profile_materials:
+        errors.append("No Hair Tool profile material")
+
+    status = "ERROR" if errors else "WARN" if warnings else "OK"
+    return {
+        "object_name": source.name,
+        "mesh_data_name": source.data.name if source.data else "",
+        "asset_unit": asset_name,
+        "json_name": clean_token(asset_name),
+        "parent_chain": [parent.name for parent in parent_chain(source)],
+        "armatures": armature_names_for_object(source),
+        "transfer_source": transfer_source_name_for_object(source),
+        "transfer_shape_keys": transfer_shape_keys_enabled(source),
+        "transfer_weights": transfer_weights_enabled(source),
+        "export_kind": "Hair Source",
+        "export_action": "Hair source",
+        "export_details": [
+            f"Visible Hair Tool source for {asset_name}__S2U_HAIR.",
+            "Source material slots are not Unreal handoff materials; the generated hair mesh is validated separately.",
+        ],
+        "material_slots": [slot.material.name if slot.material else "" for slot in source.material_slots],
+        "handoff_materials": [material.name for material in profile_materials],
+        "texture_roles": [],
+        "painter_protected": False,
+        "painter_low": False,
+        "status": status,
+        "errors": unique_ordered_names(errors),
+        "warnings": unique_ordered_names(warnings),
+        "json_ready": True,
+    }
+
+
+def export_validation_rows(context, props=None, objects=None, materials=None, texture_map=None, hair_assets=None):
     if props is None:
         props = context.scene.ue_unique_names
     objects = list(objects) if objects is not None else validation_scope_objects(context, props.scope)
     materials = list(materials) if materials is not None else unreal_handoff_materials_from_objects(objects)
     if texture_map is None:
         texture_map = material_texture_map(materials)
+    if hair_assets is None:
+        from .utils import hair_tool_asset_groups
+        hair_assets = hair_tool_asset_groups(context, props.scope)
 
     protected = protected_painter_data(context)
     painter_low_objects = linked_painter_low_objects(context)
     export_coll = export_collection(context)
     export_objects = set(export_coll.all_objects) if export_coll else set()
     rows = []
+    for asset in hair_assets:
+        rows.extend(_hair_source_validation_row(asset, source) for source in asset["sources"])
 
     for obj in objects:
         material_slots = effective_material_slot_entries(obj)
         handoff_materials = [
             mat
-            for _slot_index, mat, _location in material_slots
-            if mat and is_unreal_handoff_material(mat)
+            for _slot_index, mat, _location in unreal_handoff_material_slot_entries(obj)
         ]
         empty_slot_count = len(material_slots) - len(
             [mat for _slot_index, mat, _location in material_slots if mat]
@@ -130,9 +251,14 @@ def validation_summary(rows):
 
 
 def validation_pipeline_summary(rows):
+    hair_units = {
+        row.get("asset_unit")
+        for row in rows
+        if row.get("export_kind") in {"Hair", "Hair Source"}
+    }
     return {
         "low": sum(1 for row in rows if row.get("painter_low")),
-        "hair": sum(1 for row in rows if row.get("export_kind") == "Hair"),
+        "hair": len([unit for unit in hair_units if unit]),
         "transfer": sum(
             1
             for row in rows

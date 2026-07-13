@@ -4,10 +4,10 @@ from pathlib import Path
 
 import bpy
 
-from .gpro import unreal_handoff_materials_from_objects
+from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
 from .naming import material_texture_map, resolve_export_dir
 from .pipeline_json import _json_refresh_validation_errors, write_unreal_pipeline_json
-from .utils import asset_prefix, validation_scope_objects
+from .utils import asset_prefix, hair_tool_asset_groups, validation_scope_objects
 
 __all__ = (
     "collect_handoff_data",
@@ -30,12 +30,23 @@ def collect_handoff_data(context=None):
     context = _context(context)
     props = _props(context)
     objects = validation_scope_objects(context, props.scope)
+    hair_assets = hair_tool_asset_groups(context, props.scope)
     materials = unreal_handoff_materials_from_objects(objects)
+    seen_materials = {material.name for material in materials}
+    for asset in hair_assets:
+        for material in asset["materials"]:
+            if (
+                is_unreal_handoff_material(material)
+                and material.name not in seen_materials
+            ):
+                materials.append(material)
+                seen_materials.add(material.name)
     texture_map = material_texture_map(materials)
     return {
         "context": context,
         "props": props,
         "objects": objects,
+        "hair_assets": hair_assets,
         "materials": materials,
         "texture_map": texture_map,
     }
@@ -49,6 +60,7 @@ def validate_handoff(context=None):
         data["objects"],
         data["materials"],
         data["texture_map"],
+        hair_assets=data["hair_assets"],
     )
     return data
 
@@ -70,6 +82,7 @@ def refresh_handoff_json(context=None):
         data["materials"],
         data["texture_map"],
         export_dir,
+        hair_assets=data["hair_assets"],
     )
     data["json_paths"] = [str(path) for path in json_paths]
     return data

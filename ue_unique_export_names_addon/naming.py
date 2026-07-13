@@ -411,10 +411,10 @@ def mesh_name_for(prefix, index, object_count):
     return prefix if object_count == 1 else f"{prefix}_{index + 1:02d}"
 
 
-def external_workflow_preview_rows(context, props, objects):
+def external_workflow_preview_rows(context, props, objects, scope=None):
     prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
     rows = []
-    units = export_naming_units(context, props.scope, objects)
+    units = export_naming_units(context, scope or props.scope, objects)
     for unit_index, unit in enumerate(units):
         unit_name = mesh_name_for(prefix, unit_index, len(units))
         root = unit["root"]

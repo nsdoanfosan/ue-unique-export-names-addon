@@ -1,0 +1,1375 @@
+bl_info = {
+    "name": "UE Unique Export Names",
+    "author": "Codex",
+    "version": (2, 8, 0),
+    "blender": (3, 6, 0),
+    "location": "View3D > Sidebar > UE Names",
+    "description": "Rename Blender materials/textures for Send to Unreal and write an Unreal postprocess manifest.",
+    "category": "Import-Export",
+}
+
+import json
+import re
+import shutil
+from pathlib import Path
+
+import bpy
+from bpy.app.handlers import persistent
+from bpy.props import BoolProperty, EnumProperty, StringProperty
+
+
+BACKUP_PROP = "_ue_unique_export_original_name"
+BACKUP_FILEPATH_PROP = "_ue_unique_export_original_filepath"
+BACKUP_FILEPATH_RAW_PROP = "_ue_unique_export_original_filepath_raw"
+# Legacy marker from versions that created Painter grouping Empties. Restore
+# still recognizes it so old .blend files can clean those generated objects up.
+CREATED_EMPTY_PROP = "_ue_unique_export_created_empty"
+AUTO_PAINTER_EXPORT_LINK_PROP = "_ue_unique_export_auto_link"
+_painter_export_sync_running = False
+
+# Send to Unreal exports the objects inside a collection named "Export"; the addon's
+# default scope mirrors that so you don't have to manually select every object.
+EXPORT_COLLECTION_NAME = "Export"
+BAKING_LOW_COLLECTION_NAME = "low"
+# The auto-linked Baking/low hierarchy is parked in this colored child collection
+# of Export instead of Export's root, so it reads as its own green group in the
+# outliner. Send to Unreal still exports it (get_from_collection walks
+# export.all_objects, which is recursive), so nesting changes nothing downstream.
+PAINTER_LOW_SUBCOLLECTION_NAME = "Exp_LOW"
+PAINTER_LOW_SUBCOLLECTION_COLOR = "COLOR_04"  # green
+
+ROLE_BY_BSDF_INPUT = {
+    "Base Color": "BaseColor",
+    "Metallic": "Metallic",
+    "Roughness": "Roughness",
+    "Normal": "Normal",
+    "Emission Color": "Emissive",
+    "Emission Strength": "Emissive",
+    "Alpha": "Alpha",
+}
+
+ROLE_PRIORITY = [
+    "BaseColor",
+    "MetallicRoughness",
+    "Normal",
+    "Emissive",
+    "Roughness",
+    "Metallic",
+    "Occlusion",
+    "Alpha",
+    "Texture",
+]
+
+PAINTER_ROLE_NAMES = {
+    "BaseColor": "Color",
+    "MetallicRoughness": "Extra",
+    "Normal": "Normal",
+    "Emissive": "Emissive",
+    "Height": "Height",
+}
+
+def clean_token(value):
+    value = str(value or "").strip()
+    value = re.sub(r"[^0-9A-Za-z_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "Asset"
+
+
+def asset_prefix(context, prefix_mode, custom_prefix):
+    if prefix_mode == "CUSTOM" and custom_prefix.strip():
+        return clean_token(custom_prefix)
+    if bpy.data.filepath:
+        return clean_token(Path(bpy.data.filepath).stem)
+    return clean_token(context.scene.name)
+
+
+def export_collection(context):
+    """Return the exact collection Send to Unreal exports from."""
+    return bpy.data.collections.get(EXPORT_COLLECTION_NAME)
+
+
+def ensure_export_collection(context):
+    coll = export_collection(context)
+    if coll is not None:
+        return coll
+    coll = bpy.data.collections.new(EXPORT_COLLECTION_NAME)
+    context.scene.collection.children.link(coll)
+    return coll
+
+
+def baking_low_collection():
+    baking = bpy.data.collections.get("Baking")
+    if baking is not None:
+        for child in baking.children:
+            if child.name == BAKING_LOW_COLLECTION_NAME:
+                return child
+    return None
+
+
+def selected_or_all_mesh_objects(context, scope):
+    if scope == "SELECTED":
+        objects = context.selected_objects
+    elif scope == "EXPORT_COLLECTION":
+        coll = export_collection(context)
+        objects = coll.all_objects if coll else []
+    else:  # "SCENE"
+        objects = context.scene.objects
+    protected_objects = linked_painter_low_objects(context)
+    return [
+        obj
+        for obj in objects
+        if obj.type == "MESH"
+        and obj not in protected_objects
+    ]
+
+
+def parent_chain(obj):
+    """Return all parents from the top-most parent down to the direct parent."""
+    chain = []
+    parent = obj.parent
+    while parent is not None:
+        chain.append(parent)
+        parent = parent.parent
+    chain.reverse()
+    return chain
+
+
+def images_from_node_tree(node_tree, visited_trees=None):
+    if node_tree is None:
+        return set()
+    if visited_trees is None:
+        visited_trees = set()
+    if node_tree in visited_trees:
+        return set()
+    visited_trees.add(node_tree)
+    images = set()
+    for node in node_tree.nodes:
+        if node.type == "TEX_IMAGE" and node.image is not None:
+            images.add(node.image)
+        group_tree = getattr(node, "node_tree", None)
+        if group_tree is not None and group_tree not in visited_trees:
+            images.update(images_from_node_tree(group_tree, visited_trees))
+    return images
+
+
+def images_from_material(material):
+    return images_from_node_tree(
+        material.node_tree if material is not None else None
+    )
+
+
+def linked_painter_low_objects(context):
+    """Meshes simultaneously present in Baking/low and Export."""
+    low_collection = baking_low_collection()
+    export_coll = export_collection(context)
+    if low_collection is None or export_coll is None:
+        return set()
+    low_meshes = {
+        obj for obj in low_export_hierarchy(low_collection)
+        if obj.type == "MESH"
+    }
+    export_objects = set(export_coll.all_objects)
+    return low_meshes & export_objects
+
+
+def protected_painter_data(context):
+    """Return all datablocks that must remain untouched by naming workflows."""
+    low_objects = linked_painter_low_objects(context)
+    export_coll = export_collection(context)
+    export_objects = set(export_coll.all_objects) if export_coll else set()
+    hierarchy = {
+        parent
+        for obj in low_objects
+        for parent in parent_chain(obj)
+        if parent in export_objects
+    }
+    objects = low_objects | hierarchy
+    meshes = {
+        obj.data for obj in objects
+        if obj.type == "MESH" and obj.data is not None
+    }
+    low_materials = {
+        slot.material
+        for obj in objects
+        for slot in obj.material_slots
+        if slot.material is not None
+    }
+    images = set()
+    for material in low_materials:
+        images.update(images_from_material(material))
+    materials = set(low_materials)
+    materials.update(
+        material
+        for material in bpy.data.materials
+        if images_from_material(material) & images
+    )
+    objects.update(
+        obj
+        for obj in bpy.data.objects
+        if obj.type == "MESH"
+        and (
+            obj.data in meshes
+            or any(
+                slot.material in materials
+                for slot in obj.material_slots
+                if slot.material is not None
+            )
+        )
+    )
+    return {
+        "objects": objects,
+        "meshes": meshes,
+        "materials": materials,
+        "images": images,
+    }
+
+
+def mutation_safe_mesh_objects(context, scope):
+    candidates = selected_or_all_mesh_objects(context, scope)
+    protected = protected_painter_data(context)
+    safe = [obj for obj in candidates if obj not in protected["objects"]]
+    skipped = [obj for obj in candidates if obj in protected["objects"]]
+    return safe, skipped, protected
+
+
+def external_materials_from_objects(context, objects, protected=None):
+    """Materials safe to mutate without affecting linked Painter Low data."""
+    if protected is None:
+        protected = protected_painter_data(context)
+    materials = []
+    skipped = []
+    for material in materials_from_objects(objects):
+        shared_images = images_from_material(material) & protected["images"]
+        if material in protected["materials"] or shared_images:
+            skipped.append(material)
+            continue
+        materials.append(material)
+    return materials, skipped
+
+
+def low_export_hierarchy(low_collection):
+    """Every object actually contained in Baking/low, with parenting untouched."""
+    return set(low_collection.all_objects)
+
+
+def painter_export_hierarchy(low_collection):
+    """Meshes in Baking/low plus their complete existing parent hierarchy."""
+    low_meshes = {
+        obj for obj in low_collection.all_objects
+        if obj.type == "MESH"
+    }
+    hierarchy = set(low_meshes)
+    for mesh in low_meshes:
+        parent = mesh.parent
+        while parent is not None:
+            hierarchy.add(parent)
+            parent = parent.parent
+    return hierarchy
+
+
+def painter_low_subcollection(export_coll, create=False):
+    """Colored child of Export that holds the auto-linked Baking/low hierarchy."""
+    if export_coll is None:
+        return None
+    sub = bpy.data.collections.get(PAINTER_LOW_SUBCOLLECTION_NAME)
+    if sub is None:
+        if not create:
+            return None
+        sub = bpy.data.collections.new(PAINTER_LOW_SUBCOLLECTION_NAME)
+    if create and sub.name not in {child.name for child in export_coll.children}:
+        export_coll.children.link(sub)
+    try:
+        sub.color_tag = PAINTER_LOW_SUBCOLLECTION_COLOR
+    except Exception:
+        pass
+    return sub
+
+
+def sync_painter_export(scene=None):
+    """Keep Baking/low meshes and their parent chains linked into Export."""
+    global _painter_export_sync_running
+    if _painter_export_sync_running:
+        return {"linked": 0, "unlinked": 0, "desired": 0}
+
+    _painter_export_sync_running = True
+    try:
+        low_collection = baking_low_collection()
+        desired = (
+            painter_export_hierarchy(low_collection)
+            if low_collection is not None
+            else set()
+        )
+
+        export_coll = bpy.data.collections.get(EXPORT_COLLECTION_NAME)
+        if desired and export_coll is None:
+            if scene is None:
+                scene = bpy.context.scene
+            if scene is None and bpy.data.scenes:
+                scene = bpy.data.scenes[0]
+            if scene is None:
+                return {"linked": 0, "unlinked": 0, "desired": len(desired)}
+            export_coll = bpy.data.collections.new(EXPORT_COLLECTION_NAME)
+            scene.collection.children.link(export_coll)
+
+        # Auto-linked low hierarchy lives in the colored Exp_LOW child of Export,
+        # not Export's root, so it reads as its own group in the outliner.
+        low_sub = painter_low_subcollection(export_coll, create=bool(desired))
+
+        linked = 0
+        if low_sub is not None:
+            for obj in sorted(desired, key=lambda item: item.name_full):
+                if low_sub.objects.get(obj.name) is not obj:
+                    low_sub.objects.link(obj)
+                    linked += 1
+                # Migrate away from the old behaviour: drop any direct Export link.
+                if export_coll is not None and export_coll.objects.get(obj.name) is obj:
+                    export_coll.objects.unlink(obj)
+                if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
+                    obj[AUTO_PAINTER_EXPORT_LINK_PROP] = True
+
+        unlinked = 0
+        for obj in list(bpy.data.objects):
+            if not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP):
+                continue
+            if obj in desired:
+                continue
+            removed = False
+            if low_sub is not None and low_sub.objects.get(obj.name) is obj:
+                low_sub.objects.unlink(obj)
+                removed = True
+            if export_coll is not None and export_coll.objects.get(obj.name) is obj:
+                export_coll.objects.unlink(obj)
+                removed = True
+            if removed:
+                unlinked += 1
+            del obj[AUTO_PAINTER_EXPORT_LINK_PROP]
+
+        return {
+            "linked": linked,
+            "unlinked": unlinked,
+            "desired": len(desired),
+        }
+    finally:
+        _painter_export_sync_running = False
+
+
+@persistent
+def sync_painter_export_on_load(_dummy):
+    sync_painter_export()
+
+
+@persistent
+def sync_painter_export_on_depsgraph(scene, _depsgraph):
+    sync_painter_export(scene)
+
+
+def sync_painter_export_deferred():
+    sync_painter_export()
+    return None
+
+
+def materials_from_objects(objects):
+    materials = []
+    seen = set()
+    for obj in objects:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat and not mat.library and mat.name not in seen:
+                materials.append(mat)
+                seen.add(mat.name)
+    return materials
+
+
+def remember_name(datablock):
+    if BACKUP_PROP not in datablock:
+        datablock[BACKUP_PROP] = datablock.name
+
+
+def remember_image_path(image):
+    if BACKUP_FILEPATH_PROP not in image:
+        image[BACKUP_FILEPATH_PROP] = image.filepath
+    if BACKUP_FILEPATH_RAW_PROP not in image:
+        image[BACKUP_FILEPATH_RAW_PROP] = image.filepath_raw
+
+
+def unique_name(collection, desired, datablock=None):
+    if datablock and datablock.name == desired:
+        return desired
+    existing = {item.name for item in collection if item is not datablock}
+    if desired not in existing:
+        return desired
+    index = 1
+    while True:
+        candidate = f"{desired}_{index:02d}"
+        if candidate not in existing:
+            return candidate
+        index += 1
+
+
+def restore_name(datablock, collection):
+    original = datablock.get(BACKUP_PROP)
+    if not original:
+        return False
+    datablock.name = unique_name(collection, original, datablock)
+    del datablock[BACKUP_PROP]
+    return True
+
+
+def restore_image_path(image):
+    restored = False
+    if BACKUP_FILEPATH_PROP in image:
+        image.filepath = image[BACKUP_FILEPATH_PROP]
+        del image[BACKUP_FILEPATH_PROP]
+        restored = True
+    if BACKUP_FILEPATH_RAW_PROP in image:
+        image.filepath_raw = image[BACKUP_FILEPATH_RAW_PROP]
+        del image[BACKUP_FILEPATH_RAW_PROP]
+        restored = True
+    return restored
+
+
+def reset_previous_prepare(materials, images):
+    for mat in materials:
+        restore_name(mat, bpy.data.materials)
+    for image in images:
+        restore_image_path(image)
+        restore_name(image, bpy.data.images)
+
+
+def image_suffix(image):
+    raw_path = (image.filepath_raw or image.filepath or "").replace("\\", "/")
+    suffix = Path(raw_path).suffix
+    if suffix:
+        return suffix
+
+    file_format = getattr(image, "file_format", "").upper()
+    if file_format in {"JPEG", "JPG"}:
+        return ".jpg"
+    if file_format == "PNG":
+        return ".png"
+    if file_format == "TARGA":
+        return ".tga"
+    if file_format == "TIFF":
+        return ".tif"
+    if file_format == "OPEN_EXR":
+        return ".exr"
+    return ".png"
+
+
+def resolve_export_dir(path_value):
+    if path_value.strip():
+        return Path(bpy.path.abspath(path_value)).resolve()
+    if bpy.data.filepath:
+        return Path(bpy.data.filepath).resolve().parent / "texture"
+    return Path(bpy.app.tempdir).resolve() / "texture"
+
+
+def find_image_node_from_socket(socket, visited=None):
+    if visited is None:
+        visited = set()
+    if not socket or not socket.is_linked:
+        return None
+
+    for link in socket.links:
+        node = link.from_node
+        if node in visited:
+            continue
+        visited.add(node)
+        if node.type == "TEX_IMAGE" and node.image and not node.image.library:
+            return node
+        for input_socket in getattr(node, "inputs", []):
+            found = find_image_node_from_socket(input_socket, visited)
+            if found:
+                return found
+    return None
+
+
+def fallback_role_from_node(node):
+    text = clean_token(f"{node.label}_{node.name}").lower()
+    if "base" in text or "albedo" in text or "diffuse" in text or "color" in text:
+        return "BaseColor"
+    if "metal" in text and ("rough" in text or "orm" in text or "mra" in text):
+        return "MetallicRoughness"
+    if "rough" in text:
+        return "Roughness"
+    if "metal" in text:
+        return "Metallic"
+    if "normal" in text or "nrm" in text:
+        return "Normal"
+    if "emiss" in text:
+        return "Emissive"
+    if "height" in text or "displace" in text:
+        return "Height"
+    if "ao" in text or "occlusion" in text:
+        return "Occlusion"
+    return "Texture"
+
+
+def material_texture_map(materials):
+    mapping = {}
+    for mat in materials:
+        textures = {}
+        if not mat.node_tree:
+            mapping[mat] = textures
+            continue
+
+        for node in mat.node_tree.nodes:
+            if node.type == "BSDF_PRINCIPLED":
+                for input_name, role in ROLE_BY_BSDF_INPUT.items():
+                    socket = node.inputs.get(input_name)
+                    image_node = find_image_node_from_socket(socket)
+                    if image_node and role not in textures:
+                        textures[role] = image_node.image
+
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image and not node.image.library:
+                role = fallback_role_from_node(node)
+                textures.setdefault(role, node.image)
+
+        if (
+            textures.get("Metallic")
+            and textures.get("Roughness")
+            and textures["Metallic"] == textures["Roughness"]
+        ):
+            textures["MetallicRoughness"] = textures["Metallic"]
+            del textures["Metallic"]
+            del textures["Roughness"]
+
+        used_images = set()
+        deduped = {}
+        for role in ROLE_PRIORITY:
+            image = textures.get(role)
+            if image and image.name not in used_images:
+                deduped[role] = image
+                used_images.add(image.name)
+        for role, image in textures.items():
+            if image and image.name not in used_images:
+                deduped[role] = image
+                used_images.add(image.name)
+        textures = deduped
+
+        mapping[mat] = textures
+    return mapping
+
+
+def ordered_unique_images(texture_map):
+    images = []
+    seen = set()
+    for textures in texture_map.values():
+        for role in ROLE_PRIORITY:
+            image = textures.get(role)
+            if image and image.name not in seen:
+                images.append(image)
+                seen.add(image.name)
+        for image in textures.values():
+            if image and image.name not in seen:
+                images.append(image)
+                seen.add(image.name)
+    return images
+
+
+def role_counts(texture_map):
+    counts = {}
+    for textures in texture_map.values():
+        for role, image in textures.items():
+            counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
+def image_role_lookup(texture_map):
+    lookup = {}
+    for textures in texture_map.values():
+        for role, image in textures.items():
+            lookup.setdefault(image, role)
+    return lookup
+
+
+def image_material_role_lookup(texture_map):
+    lookup = {}
+    for material, textures in texture_map.items():
+        for role, image in textures.items():
+            lookup.setdefault(image, (material, role))
+    return lookup
+
+
+def image_is_writable(image):
+    """True when the image can be written to PNG: it has pixels in memory, or its
+    filepath points to a real file on disk we can copy. Used as a pre-flight check so
+    the External Textures workflow doesn't rename half the datablocks and then abort
+    on an empty image (e.g. an unrendered bake target, or a Painter texture that
+    hasn't been exported yet)."""
+    if image.has_data:
+        return True
+    source_value = image.filepath_raw or image.filepath
+    if not source_value:
+        return False
+    return Path(bpy.path.abspath(source_value)).is_file()
+
+
+def image_disk_path(image):
+    source_value = image.filepath_raw or image.filepath
+    if not source_value:
+        return None
+    return Path(bpy.path.abspath(source_value)).resolve()
+
+
+def write_or_copy_image_file(image, new_name, export_dir):
+    export_dir.mkdir(parents=True, exist_ok=True)
+    target = export_dir / f"{new_name}.png"
+    old_filepath = image.filepath
+    old_filepath_raw = image.filepath_raw
+    old_format = image.file_format
+    source_value = old_filepath_raw or old_filepath
+    source = Path(bpy.path.abspath(source_value)).resolve() if source_value else None
+    if not image.has_data and source is not None and source.is_file():
+        if source != target.resolve():
+            shutil.copy2(source, target)
+        image.filepath = str(target)
+        image.filepath_raw = str(target)
+        image.file_format = "PNG"
+        return target
+    try:
+        image.filepath = str(target)
+        image.filepath_raw = str(target)
+        image.file_format = "PNG"
+        image.save()
+    except RuntimeError as error:
+        image.filepath = old_filepath
+        image.filepath_raw = old_filepath_raw
+        image.file_format = old_format
+        if source is not None and source.is_file() and "image data" in str(error).lower():
+            if source != target.resolve():
+                shutil.copy2(source, target)
+            image.filepath = str(target)
+            image.filepath_raw = str(target)
+            image.file_format = "PNG"
+            return target
+        raise
+    image.file_format = "PNG"
+    return target
+
+
+def cleanup_export_files(export_dir, prefix, preserve_paths=None):
+    if not export_dir.exists():
+        return
+    preserve_paths = {
+        Path(path).resolve()
+        for path in (preserve_paths or ())
+    }
+    for path in export_dir.glob(f"T_{prefix}_*"):
+        if path.is_file() and path.resolve() not in preserve_paths:
+            path.unlink()
+
+
+def material_name_for(prefix, index, material_count):
+    return f"M_{prefix}" if material_count == 1 else f"M_{prefix}_{index + 1:02d}"
+
+
+def mesh_name_for(prefix, index, object_count):
+    return prefix if object_count == 1 else f"{prefix}_{index + 1:02d}"
+
+
+def top_empty_parent(obj, scope_objects):
+    """Highest Empty ancestor that is still inside the naming scope."""
+    top = None
+    parent = obj.parent
+    while parent is not None and parent in scope_objects:
+        if parent.type != "EMPTY":
+            break
+        top = parent
+        parent = parent.parent
+    return top
+
+
+def export_naming_units(context, scope, objects):
+    """Build ordered top-level naming units from the requested scope."""
+    object_set = set(objects)
+    if scope == "EXPORT_COLLECTION":
+        collection = export_collection(context)
+        scope_order = list(collection.all_objects) if collection else []
+    elif scope == "SELECTED":
+        scope_order = list(context.selected_objects)
+    else:
+        scope_order = list(context.scene.objects)
+    scope_objects = set(scope_order)
+
+    units_by_root = {}
+    for mesh in objects:
+        root = top_empty_parent(mesh, scope_objects) or mesh
+        unit = units_by_root.setdefault(root, {"root": root, "meshes": []})
+        unit["meshes"].append(mesh)
+
+    ordered_units = []
+    seen_roots = set()
+    for obj in scope_order:
+        for root, unit in units_by_root.items():
+            if root in seen_roots:
+                continue
+            if obj is root or obj in unit["meshes"]:
+                ordered_units.append(unit)
+                seen_roots.add(root)
+    for root, unit in units_by_root.items():
+        if root not in seen_roots:
+            ordered_units.append(unit)
+
+    for unit in ordered_units:
+        unit["meshes"].sort(
+            key=lambda mesh: scope_order.index(mesh)
+            if mesh in scope_order else len(scope_order)
+        )
+    return ordered_units
+
+
+def material_instance_name(material_name):
+    clean_name = clean_token(material_name)
+    if clean_name.startswith("M_"):
+        return f"MI_{clean_name[2:]}"
+    if clean_name.startswith("MI_"):
+        return clean_name
+    return f"MI_{clean_name}"
+
+
+def texture_set_name(material):
+    name = clean_token(material.name)
+    return name[2:] if name.startswith("M_") else name
+
+
+def texture_name_for(material, role, index, count):
+    output_role = PAINTER_ROLE_NAMES.get(role, role)
+    name = f"T_{texture_set_name(material)}_{output_role}"
+    if count > 1:
+        name = f"{name}_{index + 1:02d}"
+    return name
+
+
+def texture_name_for_material_name(material_name, role):
+    output_role = PAINTER_ROLE_NAMES.get(role, role)
+    clean_name = clean_token(material_name)
+    texture_set = clean_name[2:] if clean_name.startswith("M_") else clean_name
+    return f"T_{texture_set}_{output_role}"
+
+
+def write_manifest(context, prefix, objects, materials, texture_map, export_dir):
+    export_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "asset_prefix": prefix,
+        "blend_file": bpy.data.filepath,
+        "texture_folder": str(export_dir),
+        "objects": [],
+        "materials": [],
+    }
+
+    for obj in objects:
+        manifest["objects"].append(
+            {
+                "name": obj.name,
+                "material_slots": [slot.material.name if slot.material else "" for slot in obj.material_slots],
+            }
+        )
+
+    for mat in materials:
+        textures = {}
+        for role, image in texture_map.get(mat, {}).items():
+            textures[role] = {
+                "image_name": image.name,
+                "file_path": bpy.path.abspath(image.filepath_raw or image.filepath),
+            }
+        manifest["materials"].append(
+            {
+                "material_name": mat.name,
+                "original_material_name": mat.get(BACKUP_PROP, mat.name),
+                "material_instance_name": material_instance_name(mat.name),
+                "textures": textures,
+            }
+        )
+
+    manifest_path = export_dir / f"{prefix}_ue_material_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    context.scene.ue_unique_names.last_manifest_path = str(manifest_path)
+    return manifest_path
+
+
+def first_slot_index_for_material(objects, material):
+    for obj in objects:
+        for slot_index, slot in enumerate(obj.material_slots):
+            if slot.material == material:
+                return slot_index
+    return 0
+
+
+def is_translucent_material(mat):
+    """블렌더 머티리얼이 반투명인지 판정. EEVEE Next(4.2+)와 구버전 모두 대응.
+    언리얼 파이프라인이 이 플래그를 보고 해당 메쉬의 Nanite 를 끈다."""
+    # Blender 4.2+ (EEVEE Next): surface_render_method ∈ {'DITHERED', 'BLENDED'}
+    method = getattr(mat, "surface_render_method", None)
+    if method is not None:
+        return method == "BLENDED"
+    # 구버전: blend_method ∈ {'OPAQUE','CLIP','HASHED','BLEND'}
+    legacy = getattr(mat, "blend_method", "OPAQUE")
+    return legacy in {"BLEND", "HASHED"}
+
+
+def _material_json_entry(mat, slot_index, texture_map):
+    textures = []
+    for role, image in texture_map.get(mat, {}).items():
+        textures.append(
+            {
+                "param": role,
+                "asset_name": image.name,
+                "file": bpy.path.abspath(image.filepath_raw or image.filepath).replace("\\", "/"),
+            }
+        )
+    return {
+        "name": mat.name,
+        "slot_index": slot_index,
+        "translucent": is_translucent_material(mat),
+        "textures": textures,
+    }
+
+
+def _write_pipeline_sidecar(json_dir, mesh_name, prefix, material_entries):
+    data = {
+        "mesh_name": mesh_name,
+        "asset_prefix": prefix,
+        "materials": material_entries,
+    }
+    json_path = json_dir / f"{mesh_name}.json"
+    json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return json_path
+
+
+def write_unreal_pipeline_json(
+    context,
+    prefix,
+    objects,
+    materials,
+    texture_map,
+    json_dir,
+    combined_only=False,
+):
+    json_dir.mkdir(parents=True, exist_ok=True)
+    json_paths = []
+    object_names = {clean_token(obj.name) for obj in objects}
+
+    if not combined_only:
+        # Per mesh-object sidecar for the normal non-combined export workflow.
+        for obj in objects:
+            mesh_name = clean_token(obj.name)
+            entries = []
+            seen_materials = set()
+            for slot_index, slot in enumerate(obj.material_slots):
+                mat = slot.material
+                if not mat or mat in seen_materials:
+                    continue
+                seen_materials.add(mat)
+                entries.append(_material_json_entry(mat, slot_index, texture_map))
+            json_paths.append(_write_pipeline_sidecar(json_dir, mesh_name, prefix, entries))
+
+    # 2) Per EMPTY-parent sidecar. Send to Unreal "Combine > Child meshes" merges an empty's child
+    #    meshes into ONE asset named after the empty (combine_assets.py pre_mesh_export), so without
+    #    this the combined mesh has no matching <name>.json and its materials break. We aggregate all
+    #    child materials (unique, first-encounter order). The Unreal side matches slots by material
+    #    name, so slot_index here is only a best-effort hint for the combined slot order.
+    children_by_empty = {}
+    empties_in_order = []
+    for obj in objects:
+        parent = obj.parent
+        if parent and parent.type == "EMPTY":
+            if parent.name not in children_by_empty:
+                children_by_empty[parent.name] = []
+                empties_in_order.append(parent)
+            children_by_empty[parent.name].append(obj)
+
+    for empty in empties_in_order:
+        empty_name = clean_token(empty.name)
+        # If a mesh object already owns this name, its per-object sidecar wins — don't clobber it.
+        if empty_name in object_names:
+            continue
+        entries = []
+        seen_materials = set()
+        slot_index = 0
+        for obj in children_by_empty[empty.name]:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not mat or mat in seen_materials:
+                    continue
+                seen_materials.add(mat)
+                entries.append(_material_json_entry(mat, slot_index, texture_map))
+                slot_index += 1
+        if entries:
+            json_paths.append(_write_pipeline_sidecar(json_dir, empty_name, prefix, entries))
+
+    if json_paths:
+        context.scene.ue_unique_names.last_pipeline_json_path = str(json_paths[-1])
+    return json_paths
+
+
+class UEUN_OT_prepare_names(bpy.types.Operator):
+    bl_idname = "ue_unique_names.prepare"
+    bl_label = "Prepare External Textures"
+    bl_description = "Normalize external material and texture names, write files, and create Unreal JSON"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.ue_unique_names
+        prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
+        objects, skipped_objects, protected = mutation_safe_mesh_objects(
+            context, props.scope
+        )
+        if not objects:
+            if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
+                self.report(
+                    {"WARNING"},
+                    "'Export' 콜렉션을 찾지 못했습니다 — Scope가 Export Collection입니다 "
+                    "(no 'Export' collection found; Scope = Export Collection).",
+                )
+            else:
+                self.report({"WARNING"}, "대상 메쉬가 없습니다 (no mesh objects found).")
+            return {"CANCELLED"}
+
+        materials, skipped_materials = external_materials_from_objects(
+            context, objects, protected
+        )
+        if not materials:
+            self.report(
+                {"WARNING"},
+                "변경 가능한 머티리얼이 없습니다. Painter Low와 공유하는 "
+                "머티리얼/이미지는 보호됩니다 (no safe external materials).",
+            )
+            return {"CANCELLED"}
+        texture_map = material_texture_map(materials)
+        images = ordered_unique_images(texture_map)
+        reset_previous_prepare(materials, images)
+
+        texture_map = material_texture_map(materials)
+        images = ordered_unique_images(texture_map)
+        image_context = image_material_role_lookup(texture_map)
+        export_dir = resolve_export_dir(props.texture_export_dir)
+        protected_paths = {
+            path
+            for image in protected["images"]
+            for path in [image_disk_path(image)]
+            if path is not None
+        }
+
+        # Pre-flight: when writing files, confirm every image CAN be written before
+        # renaming anything. Otherwise an empty image (no pixels, no file on disk)
+        # aborts mid-run and leaves materials/images half-renamed.
+        if props.texture_handling == "WRITE_FILES":
+            blockers = []
+            for image in images:
+                if image_is_writable(image):
+                    continue
+                material, _role = image_context.get(image, (None, None))
+                origin = f"머티리얼 '{material.name}'" if material else "소속 머티리얼 불명"
+                blockers.append(f"{image.name} ({origin})")
+            if blockers:
+                print("[UE Unique Names] 저장 불가 이미지 (no pixel data / no file):", blockers)
+                self.report(
+                    {"ERROR"},
+                    "픽셀 데이터도 없고 디스크에 파일도 없는 이미지가 있어 아무것도 바꾸지 않고 "
+                    "중단했습니다. Painter에서 텍스처를 먼저 export하거나 해당 빈 텍스처 노드를 "
+                    "삭제한 뒤 다시 실행하세요 "
+                    "(image has no pixel data and no file on disk): "
+                    + ", ".join(blockers),
+                )
+                return {"CANCELLED"}
+            planned_material_names = {
+                material: material_name_for(
+                    prefix, index, len(materials)
+                )
+                for index, material in enumerate(materials)
+            }
+            protected_collisions = []
+            for image in images:
+                material, role = image_context.get(
+                    image, (materials[0], "Texture")
+                )
+                planned_name = texture_name_for_material_name(
+                    planned_material_names[material],
+                    role,
+                )
+                planned_path = (export_dir / f"{planned_name}.png").resolve()
+                if planned_path in protected_paths:
+                    protected_collisions.append(planned_path.name)
+            if protected_collisions:
+                self.report(
+                    {"ERROR"},
+                    "생성할 텍스처가 Painter Low의 보호 파일과 충돌합니다. "
+                    "Prefix 또는 Texture Folder를 바꾸세요: "
+                    + ", ".join(sorted(set(protected_collisions))),
+                )
+                return {"CANCELLED"}
+            cleanup_export_files(
+                export_dir,
+                prefix,
+                preserve_paths=protected_paths,
+            )
+
+        for index, mat in enumerate(materials):
+            remember_name(mat)
+            mat.name = unique_name(bpy.data.materials, material_name_for(prefix, index, len(materials)), mat)
+
+        texture_file_count = 0
+        for image in images:
+            remember_name(image)
+            remember_image_path(image)
+            material, role = image_context.get(image, (materials[0], "Texture"))
+            new_name = unique_name(
+                bpy.data.images,
+                texture_name_for(material, role, 0, 1),
+                image,
+            )
+            image.name = new_name
+            if props.texture_handling == "WRITE_FILES":
+                try:
+                    write_or_copy_image_file(image, new_name, export_dir)
+                except RuntimeError as error:
+                    print(f"[UE Unique Names] 텍스처 저장 실패 (write failed): {new_name} -> {error}")
+                    self.report(
+                        {"ERROR"},
+                        f"텍스처 '{new_name}' 저장에 실패했습니다 (failed to write texture): "
+                        f"{error}. 이미 바뀐 이름은 'Restore Original Names'로 되돌릴 수 있습니다.",
+                    )
+                    return {"CANCELLED"}
+                texture_file_count += 1
+            elif props.rename_image_paths:
+                suffix = image_suffix(image)
+                image.filepath = f"//textures/{new_name}{suffix}"
+                image.filepath_raw = image.filepath
+
+        manifest_path = None
+        pipeline_json_paths = []
+        if props.write_manifest and props.texture_handling == "WRITE_FILES":
+            manifest_path = write_manifest(context, prefix, objects, materials, texture_map, export_dir)
+            pipeline_json_paths = write_unreal_pipeline_json(context, prefix, objects, materials, texture_map, export_dir)
+
+        self.report(
+            {"INFO"},
+            f"완료 (done): 머티리얼 {len(materials)}개 · 텍스처 {len(images)}개 · "
+            f"파일 {texture_file_count}개 작성"
+            + (
+                f" · 보호 데이터 공유 메쉬 {len(skipped_objects)}개 제외"
+                if skipped_objects else ""
+            )
+            + (
+                f" · 보호된 공유 머티리얼 {len(skipped_materials)}개 제외"
+                if skipped_materials else ""
+            )
+            + (f" · manifest {manifest_path.name}" if manifest_path else "")
+            + (f" · JSON {len(pipeline_json_paths)}개" if pipeline_json_paths else "")
+            + ". (.blend는 저장되지 않았습니다 / file not saved)",
+        )
+        return {"FINISHED"}
+
+
+class UEUN_OT_restore_names(bpy.types.Operator):
+    bl_idname = "ue_unique_names.restore"
+    bl_label = "Restore Original Names"
+    bl_description = "Restore names and paths changed by Prepare Unique Names"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        protected = protected_painter_data(context)
+        restored = 0
+        for mat in bpy.data.materials:
+            if mat in protected["materials"]:
+                continue
+            if restore_name(mat, bpy.data.materials):
+                restored += 1
+        for image in bpy.data.images:
+            if image in protected["images"]:
+                continue
+            path_restored = restore_image_path(image)
+            name_restored = restore_name(image, bpy.data.images)
+            if path_restored or name_restored:
+                restored += 1
+        for obj in bpy.data.objects:
+            if obj in protected["objects"]:
+                continue
+            if restore_name(obj, bpy.data.objects):
+                restored += 1
+        for mesh in bpy.data.meshes:
+            if mesh in protected["meshes"]:
+                continue
+            if restore_name(mesh, bpy.data.meshes):
+                restored += 1
+
+        # Remove Empties that Prepare Painter Asset created, but only the ones that
+        # are now empty (no children left), so a group the user still relies on is
+        # never deleted.
+        removed_empties = 0
+        for obj in list(bpy.data.objects):
+            if obj.type == "EMPTY" and obj.get(CREATED_EMPTY_PROP) and not obj.children:
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed_empties += 1
+
+        self.report(
+            {"INFO"},
+            f"완료 (done): 이름/경로 {restored}개 복원"
+            + (f" · 빈 Empty {removed_empties}개 삭제" if removed_empties else "")
+            + " (restored).",
+        )
+        return {"FINISHED"}
+
+
+class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
+    bl_idname = "ue_unique_names.prepare_mesh_names"
+    bl_label = "Prepare Mesh Names"
+    bl_description = "Rename mesh objects and mesh data from the configured prefix"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.ue_unique_names
+        prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
+        objects, skipped_objects, protected = mutation_safe_mesh_objects(
+            context, props.scope
+        )
+        if not objects:
+            if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
+                self.report(
+                    {"WARNING"},
+                    "'Export' 콜렉션을 찾지 못했습니다 — Scope가 Export Collection입니다 "
+                    "(no 'Export' collection found; Scope = Export Collection).",
+                )
+            else:
+                self.report({"WARNING"}, "대상 메쉬가 없습니다 (no mesh objects found).")
+            return {"CANCELLED"}
+
+        units = export_naming_units(context, props.scope, objects)
+        protected_meshes = protected["meshes"]
+        roots = [
+            unit["root"]
+            for unit in units
+            if unit["root"].type == "EMPTY"
+        ]
+        for root in roots:
+            restore_name(root, bpy.data.objects)
+        for obj in objects:
+            restore_name(obj, bpy.data.objects)
+            if (
+                obj.data
+                and not obj.data.library
+                and obj.data not in protected_meshes
+            ):
+                restore_name(obj.data, bpy.data.meshes)
+
+        # Park every target name first so units do not collide with one another
+        # while A_01/A_02 and child suffixes are assigned.
+        for index, root in enumerate(roots):
+            remember_name(root)
+            root.name = f"__ueun_root_{index:04d}"
+        for index, obj in enumerate(objects):
+            remember_name(obj)
+            obj.name = f"__ueun_mesh_{index:04d}"
+            if (
+                obj.data
+                and not obj.data.library
+                and obj.data not in protected_meshes
+            ):
+                remember_name(obj.data)
+                obj.data.name = f"__ueun_data_{index:04d}"
+
+        renamed_meshes = 0
+        for unit_index, unit in enumerate(units):
+            unit_name = mesh_name_for(prefix, unit_index, len(units))
+            root = unit["root"]
+            meshes = unit["meshes"]
+            if root.type == "EMPTY":
+                root.name = unique_name(bpy.data.objects, unit_name, root)
+                for child_index, mesh in enumerate(meshes, 1):
+                    child_name = f"{root.name}_{child_index:02d}"
+                    mesh.name = unique_name(bpy.data.objects, child_name, mesh)
+                    if (
+                        mesh.data
+                        and not mesh.data.library
+                        and mesh.data not in protected_meshes
+                    ):
+                        mesh.data.name = unique_name(
+                            bpy.data.meshes, mesh.name, mesh.data
+                        )
+                    renamed_meshes += 1
+            else:
+                root.name = unique_name(bpy.data.objects, unit_name, root)
+                if (
+                    root.data
+                    and not root.data.library
+                    and root.data not in protected_meshes
+                ):
+                    root.data.name = unique_name(
+                        bpy.data.meshes, root.name, root.data
+                    )
+                renamed_meshes += 1
+
+        self.report(
+            {"INFO"},
+            f"완료 (done): Export 단위 {len(units)}개 · 메쉬 이름 {renamed_meshes}개 정리"
+            + (
+                f" · 보호 데이터 공유 메쉬 {len(skipped_objects)}개 제외"
+                if skipped_objects else ""
+            )
+            + ". (.blend 저장 안 됨 / file not saved)",
+        )
+        return {"FINISHED"}
+
+
+class UEUN_OT_prepare_external_asset(bpy.types.Operator):
+    bl_idname = "ue_unique_names.prepare_external_asset"
+    bl_label = "Prepare External Asset"
+    bl_description = (
+        "Rename mesh objects/data first, then normalize external material and "
+        "texture names and write Unreal files"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        mesh_result = bpy.ops.ue_unique_names.prepare_mesh_names()
+        if "FINISHED" not in mesh_result:
+            self.report(
+                {"ERROR"},
+                "메쉬 이름 준비에 실패해 External 작업을 중단했습니다 "
+                "(mesh naming failed; external workflow stopped).",
+            )
+            return {"CANCELLED"}
+
+        texture_result = bpy.ops.ue_unique_names.prepare()
+        if "FINISHED" not in texture_result:
+            self.report(
+                {"ERROR"},
+                "메쉬 이름은 변경됐지만 텍스처 준비에 실패했습니다. "
+                "필요하면 Restore Original Names로 되돌리세요 "
+                "(mesh names changed, texture preparation failed).",
+            )
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            "External 작업 완료: 메쉬 이름 정리 후 텍스처를 정리했습니다 "
+            "(mesh names first, textures second).",
+        )
+        return {"FINISHED"}
+
+
+class UEUN_PG_settings(bpy.types.PropertyGroup):
+    scope: EnumProperty(
+        name="Scope",
+        items=[
+            ("EXPORT_COLLECTION", "Export Collection",
+             "Mesh objects inside the 'Export' collection (what Send to Unreal exports)"),
+            ("SELECTED", "Selected Objects", "Only selected mesh objects"),
+            ("SCENE", "Whole Scene", "All mesh objects in the current scene"),
+        ],
+        default="EXPORT_COLLECTION",
+    )
+    prefix_mode: EnumProperty(
+        name="Prefix",
+        items=[
+            ("BLEND", "Blend File Name", "Use the .blend file name"),
+            ("SCENE", "Scene Name", "Use the scene name"),
+            ("CUSTOM", "Custom", "Use the custom prefix below"),
+        ],
+        default="BLEND",
+    )
+    custom_prefix: StringProperty(name="Custom Prefix", default="")
+    texture_handling: EnumProperty(
+        name="Texture Handling",
+        items=[
+            ("WRITE_FILES", "Write Texture Files", "Write texture files beside the .blend file"),
+            ("RENAME_PATHS", "Rename Paths Only", "Only rewrite image path strings"),
+        ],
+        default="WRITE_FILES",
+    )
+    texture_export_dir: StringProperty(
+        name="Texture Folder",
+        description="Empty means the shared texture folder beside the .blend file",
+        subtype="DIR_PATH",
+        default="",
+    )
+    rename_image_paths: BoolProperty(name="Rename Texture Path Strings", default=True)
+    write_manifest: BoolProperty(name="Write Unreal Manifest", default=True)
+    last_manifest_path: StringProperty(name="Last Manifest", default="")
+    last_pipeline_json_path: StringProperty(name="Last Pipeline JSON", default="")
+
+
+class UEUN_PT_panel(bpy.types.Panel):
+    bl_label = "UE Unique Names"
+    bl_idname = "UEUN_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UE Names"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.ue_unique_names
+        layout.label(text="Asset Naming", icon="TAG")
+        layout.prop(props, "prefix_mode")
+        if props.prefix_mode == "CUSTOM":
+            layout.prop(props, "custom_prefix")
+        layout.prop(props, "texture_export_dir")
+
+        external_box = layout.box()
+        external_box.label(text="External Texture Workflow", icon="FILE_IMAGE")
+        external_box.prop(props, "scope")
+        external_box.prop(props, "texture_handling")
+        if props.texture_handling == "WRITE_FILES":
+            external_box.prop(props, "write_manifest")
+        else:
+            external_box.prop(props, "rename_image_paths")
+        ext_objects = selected_or_all_mesh_objects(context, props.scope)
+        external_box.label(
+            text=f"대상 메쉬 {len(ext_objects)}개 (target meshes)",
+            icon="INFO" if ext_objects else "ERROR",
+        )
+        external_box.operator(
+            "ue_unique_names.prepare_external_asset",
+            text="Prepare External Asset",
+            icon="CHECKMARK",
+        )
+        if props.last_manifest_path:
+            layout.label(text=Path(props.last_manifest_path).name)
+        if props.last_pipeline_json_path:
+            layout.label(text=Path(props.last_pipeline_json_path).name)
+        layout.operator("ue_unique_names.restore", icon="LOOP_BACK")
+
+
+classes = (
+    UEUN_PG_settings,
+    UEUN_OT_prepare_mesh_names,
+    UEUN_OT_prepare_names,
+    UEUN_OT_prepare_external_asset,
+    UEUN_OT_restore_names,
+    UEUN_PT_panel,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.ue_unique_names = bpy.props.PointerProperty(type=UEUN_PG_settings)
+    if sync_painter_export_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(sync_painter_export_on_load)
+    if sync_painter_export_on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            sync_painter_export_on_depsgraph
+        )
+    if not bpy.app.timers.is_registered(sync_painter_export_deferred):
+        bpy.app.timers.register(sync_painter_export_deferred, first_interval=0.1)
+
+
+def unregister():
+    if bpy.app.timers.is_registered(sync_painter_export_deferred):
+        bpy.app.timers.unregister(sync_painter_export_deferred)
+    if sync_painter_export_on_depsgraph in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(
+            sync_painter_export_on_depsgraph
+        )
+    if sync_painter_export_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(sync_painter_export_on_load)
+    if hasattr(bpy.types.Scene, "ue_unique_names"):
+        del bpy.types.Scene.ue_unique_names
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()

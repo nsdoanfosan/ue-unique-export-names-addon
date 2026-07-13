@@ -77,11 +77,17 @@ def json_scope_mesh_objects(context, scope):
 
 def scope_objects_for_validation(context, scope):
     if scope == "SELECTED":
-        return list(context.selected_objects)
+        return [obj for obj in context.selected_objects if obj.visible_get()]
     if scope == "EXPORT_COLLECTION":
         coll = export_collection(context)
-        return list(coll.all_objects) if coll else []
-    return list(context.scene.objects)
+        if not coll:
+            return []
+        return [
+            obj
+            for obj in coll.all_objects
+            if coll in obj.users_collection and obj.visible_get()
+        ]
+    return [obj for obj in context.scene.objects if obj.visible_get()]
 
 
 def is_edit_mesh_modifier(modifier):
@@ -124,20 +130,105 @@ def hair_tool_input_object(obj):
     return None
 
 
-def validation_scope_objects(context, scope):
-    objects = scope_objects_for_validation(context, scope)
-    mesh_objects = [obj for obj in objects if obj.type == "MESH"]
-    hair_candidates = [obj for obj in objects if is_hair_tool_object(obj)]
+def hair_tool_profile_materials(obj):
+    materials = []
+    seen = set()
+    for modifier in obj.modifiers:
+        node_group = getattr(modifier, "node_group", None)
+        if (
+            modifier.type != "NODES"
+            or not node_group
+            or not node_group.name.startswith("Hair_System_Profile")
+        ):
+            continue
+        for key in modifier.keys():
+            value = modifier.get(key)
+            if not isinstance(value, bpy.types.Material):
+                continue
+            if value.name in seen:
+                continue
+            materials.append(value)
+            seen.add(value.name)
+    return materials
+
+
+def hair_tool_asset_group_key(context, obj):
+    """Mirror Send2UE Hair Tool grouping: nearest exported Empty ancestor."""
+    coll = export_collection(context)
+    exported_objects = set(coll.all_objects) if coll else set()
+    parent = obj.parent
+    while parent is not None:
+        if parent.type == "EMPTY" and parent in exported_objects:
+            return parent
+        parent = parent.parent
+    return obj.parent or obj
+
+
+def hair_tool_asset_groups(context, scope):
+    coll = export_collection(context)
+    if coll is None:
+        return []
+    scope_objects = set(scope_objects_for_validation(context, scope))
+    source_candidates = [
+        obj
+        for obj in coll.all_objects
+        if (
+            obj in scope_objects
+            and coll in obj.users_collection
+            and is_hair_tool_object(obj)
+        )
+    ]
     upstream_hair = {
         input_object
-        for input_object in (hair_tool_input_object(obj) for obj in hair_candidates)
-        if input_object in hair_candidates
+        for input_object in (hair_tool_input_object(obj) for obj in source_candidates)
+        if input_object in source_candidates
     }
+    source_objects = [
+        obj
+        for obj in source_candidates
+        if obj not in upstream_hair
+    ]
+
+    groups = []
+    group_by_name = {}
+    for obj in source_objects:
+        asset_parent = hair_tool_asset_group_key(context, obj)
+        asset_name = asset_parent.name if asset_parent != obj else obj.name
+        group = group_by_name.get(asset_name)
+        if group is None:
+            group = {
+                "asset_name": asset_name,
+                "asset_parent": asset_parent,
+                "sources": [],
+                "materials": [],
+            }
+            group_by_name[asset_name] = group
+            groups.append(group)
+        group["sources"].append(obj)
+        seen_materials = {material.name for material in group["materials"]}
+        for material in hair_tool_profile_materials(obj):
+            if material.name in seen_materials:
+                continue
+            group["materials"].append(material)
+            seen_materials.add(material.name)
+    return groups
+
+
+def validation_scope_objects(context, scope):
+    objects = scope_objects_for_validation(context, scope)
+    hair_sources = {
+        source
+        for group in hair_tool_asset_groups(context, scope)
+        for source in group["sources"]
+    }
+    mesh_objects = [
+        obj
+        for obj in objects
+        if obj.type == "MESH" and obj not in hair_sources
+    ]
     rows = []
     seen = set()
-    for obj in [*mesh_objects, *hair_candidates]:
-        if obj in upstream_hair:
-            continue
+    for obj in mesh_objects:
         if obj.name in seen:
             continue
         rows.append(obj)
