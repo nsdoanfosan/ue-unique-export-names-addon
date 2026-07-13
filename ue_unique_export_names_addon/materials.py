@@ -117,3 +117,26 @@ def external_materials_from_objects(context, objects, protected=None):
             continue
         materials.append(material)
     return materials, skipped
+
+
+def external_data_shared_outside_objects(context, materials, objects):
+    """Return selected external data that is also used by unselected meshes."""
+    target_objects = set(objects)
+    outside_objects = [
+        obj
+        for obj in context.scene.objects
+        if obj.type == "MESH" and obj not in target_objects
+    ]
+    outside_materials = set(materials_from_objects(outside_objects))
+    outside_images = set()
+    for material in outside_materials:
+        outside_images.update(images_from_material(material))
+
+    shared_materials = [material for material in materials if material in outside_materials]
+    shared_images = set()
+    for material in materials:
+        shared_images.update(images_from_material(material) & outside_images)
+    return {
+        "materials": shared_materials,
+        "images": sorted(shared_images, key=lambda image: image.name.casefold()),
+    }

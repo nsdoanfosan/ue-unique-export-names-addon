@@ -94,6 +94,8 @@ the External naming workflow.
 ## External Asset Workflow
 
 Use this for assets and images that are not managed by the Painter Low workflow.
+This workflow is always selection-scoped. The Unreal Handoff `Scope` setting
+does not broaden External preparation beyond the selected mesh objects.
 
 Before running:
 
@@ -169,6 +171,9 @@ Generated PNG, manifest, and JSON files are not deleted from disk.
 
 ## Scope Reference
 
+- **External Texture Workflow**: selected mesh objects only; shared mesh,
+  material, or image datablocks used by unselected meshes block the operation
+  until they are made single-user;
 - **Export Collection**: meshes recursively contained in `Export`;
 - **Selected Objects**: selected mesh objects only;
 - **Whole Scene**: all mesh objects in the current scene.
