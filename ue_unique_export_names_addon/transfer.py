@@ -75,7 +75,7 @@ def export_detail_lines_for_object(obj):
         return []
     return [
         "Hair Tool source: Send2UE bakes this object to a temporary mesh before FBX export.",
-        "Generated mesh: evaluated cards are joined per export asset, UVMapGN becomes UVMap, and RFAOS is packed as RGBA = Random/Factor/AO/SystemColor Alpha.",
+        "Generated mesh: evaluated cards are joined per export asset, UVMapGN becomes UVMap, RFAOS is packed as RGBA = Random/Factor/AO/SystemColor Alpha, and UV2/UV3 mirror that payload for Skeletal Nanite.",
         "Rigging: the export mesh gets the detected head bone vertex group at weight 1.0 plus an Armature modifier.",
         "Transfer: Shape Keys / Weights are read from the JSON sidecar before Send2UE exports the baked mesh.",
     ]

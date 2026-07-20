@@ -26,8 +26,6 @@ HAIR_TEXTURE_SUFFIXES = {
     "ORM Map": "ORM",
     "Opacity Map": "Opacity",
 }
-HAIR_TOOL_CONTROL_SOURCE_MATERIAL = "HT_Default_Material"
-
 TREE_PART_ALIASES = {
     "leaf": "leaf",
     "leaves": "leaf",
@@ -240,26 +238,13 @@ def _hair_socket_value(node, name, fallback):
     return float(value)
 
 
-def _hair_control_source_material(mat):
-    """Resolve the editable Hair Tool source for generated M_HT_* card materials."""
-    material_name = clean_token(mat.name).lower()
-    if not material_name.startswith("m_ht_default_material"):
-        return mat
-    source = bpy.data.materials.get(HAIR_TOOL_CONTROL_SOURCE_MATERIAL)
-    if source is None or _hair_shader_node(source) is None:
-        return mat
-    return source
-
-
 def _hair_tool_json(mat):
     node = _hair_shader_node(mat)
-    control_material = _hair_control_source_material(mat)
-    control_node = _hair_shader_node(control_material)
     base_color = _hair_socket_value(node, "Base Color", [0.8, 0.8, 0.8, 1.0])
-    root_color = _hair_socket_value(control_node, "Root Color", [0.0, 0.0, 0.0, 1.0])
-    tip_color = _hair_socket_value(control_node, "Tip Color", [0.8, 0.8, 0.8, 1.0])
+    root_color = _hair_socket_value(node, "Root Color", [0.0, 0.0, 0.0, 1.0])
+    tip_color = _hair_socket_value(node, "Tip Color", [0.8, 0.8, 0.8, 1.0])
     return {
-        "control_source_material": control_material.name,
+        "control_source_material": mat.name,
         "vertex_color": {
             "name": "RFAOS",
             "R": "Random",
@@ -271,22 +256,16 @@ def _hair_tool_json(mat):
             "HT Base Color": base_color,
             "HT Root Color": root_color,
             "HT Tip Color": tip_color,
-            "System Color 01": base_color,
-            "System Color 02": tip_color,
         },
         "scalar_parameters": {
-            "HT Root Mix": _hair_socket_value(control_node, "Root Color Mix Factor", 0.0),
-            "HT Root Range": _hair_socket_value(control_node, "Root Color Range", 0.0),
-            "HT Root Random Influence": _hair_socket_value(control_node, "Root Texture Overaly", 0.0),
-            "HT Root Random Brightness": _hair_socket_value(control_node, "Root  Texture Brightness", 0.0),
-            "HT Tip Mix": _hair_socket_value(control_node, "Tip Color Mix Factor", 0.0),
-            "HT Tip Range": _hair_socket_value(control_node, "Tip Color Range", 0.0),
-            "HT Tip Random Influence": _hair_socket_value(control_node, "Tip Texture Overlay", 0.0),
-            "HT Tip Random Brightness": _hair_socket_value(control_node, "Tip  Texture Brightness", 0.0),
-            "System Color Influence": 0.0,
-            "System Mask Contrast": 1.0,
-            "System Mask Bias": 0.0,
-            "Roughness Multiplier": 1.0,
+            "HT Root Mix": _hair_socket_value(node, "Root Color Mix Factor", 0.0),
+            "HT Root Range": _hair_socket_value(node, "Root Color Range", 0.0),
+            "HT Root Random Influence": _hair_socket_value(node, "Root Texture Overaly", 0.0),
+            "HT Root Random Brightness": _hair_socket_value(node, "Root  Texture Brightness", 0.0),
+            "HT Tip Mix": _hair_socket_value(node, "Tip Color Mix Factor", 0.0),
+            "HT Tip Range": _hair_socket_value(node, "Tip Color Range", 0.0),
+            "HT Tip Random Influence": _hair_socket_value(node, "Tip Texture Overlay", 0.0),
+            "HT Tip Random Brightness": _hair_socket_value(node, "Tip  Texture Brightness", 0.0),
             "Roughness Minimum": _hair_socket_value(node, "SpecRoughness", 0.08),
         },
     }
