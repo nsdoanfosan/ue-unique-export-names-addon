@@ -26,11 +26,12 @@ def _props(context):
     return context.scene.ue_unique_names
 
 
-def collect_handoff_data(context=None):
+def collect_handoff_data(context=None, scope=None):
     context = _context(context)
     props = _props(context)
-    objects = validation_scope_objects(context, props.scope)
-    hair_assets = hair_tool_asset_groups(context, props.scope)
+    effective_scope = scope or props.scope
+    objects = validation_scope_objects(context, effective_scope)
+    hair_assets = hair_tool_asset_groups(context, effective_scope)
     materials = unreal_handoff_materials_from_objects(objects)
     seen_materials = {material.name for material in materials}
     for asset in hair_assets:
@@ -45,6 +46,7 @@ def collect_handoff_data(context=None):
     return {
         "context": context,
         "props": props,
+        "scope": effective_scope,
         "objects": objects,
         "hair_assets": hair_assets,
         "materials": materials,
@@ -52,8 +54,8 @@ def collect_handoff_data(context=None):
     }
 
 
-def validate_handoff(context=None):
-    data = collect_handoff_data(context)
+def validate_handoff(context=None, scope=None):
+    data = collect_handoff_data(context, scope=scope)
     data["errors"] = _json_refresh_validation_errors(
         data["context"],
         data["props"],
@@ -65,8 +67,8 @@ def validate_handoff(context=None):
     return data
 
 
-def refresh_handoff_json(context=None):
-    data = validate_handoff(context)
+def refresh_handoff_json(context=None, scope=None):
+    data = validate_handoff(context, scope=scope)
     props = data["props"]
     export_dir = resolve_export_dir(props.texture_export_dir)
     data["export_dir"] = str(export_dir)

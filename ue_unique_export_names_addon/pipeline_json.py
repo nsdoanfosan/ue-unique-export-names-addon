@@ -4,6 +4,7 @@ from pathlib import Path
 import bpy
 
 from .constants import MATERIAL_PREFIX
+from .contract import speedtree_handoff_contract
 from .gpro import (
     effective_material_slot_entries,
     has_gpro_instance_material_source,
@@ -12,7 +13,13 @@ from .gpro import (
     unreal_handoff_material_slot_entries,
 )
 from .transfer import transfer_postprocess_entry
-from .unreal_material_json import _material_json_entry
+from .unreal_material_json import (
+    _material_json_entry,
+    _speedtree_material_intent,
+    _unreal_instance_profile,
+    is_translucent_material,
+    master_preset_for_material,
+)
 from .utils import clean_token, export_collection
 from .validation import export_validation_rows
 from .validation import _hair_asset_validation_row
@@ -72,6 +79,44 @@ def _cleanup_json_entry(material_entries):
     }
 
 
+def _material_master_for_entries(material_entries):
+    if material_entries and all(
+        entry.get("master_preset") == "tree"
+        for entry in material_entries
+    ):
+        return "tree"
+    return "prop"
+
+
+def _speedtree_sidecar_descriptor(material_entries, mesh_name):
+    if not any(
+        entry.get("master_preset") == "tree"
+        for entry in material_entries
+        if isinstance(entry, dict)
+    ):
+        return None
+    contract_api = speedtree_handoff_contract()
+    if contract_api is None:
+        return None
+    return contract_api.build_sidecar_descriptor(mesh_name)
+
+
+def _speedtree_dynamic_wind_path(json_dir, mesh_name, descriptor):
+    if descriptor is None:
+        return None
+    contract_api = speedtree_handoff_contract()
+    if contract_api is None:
+        return None
+    wind_rules = contract_api.dynamic_wind_rules()
+    suffix = str(wind_rules.get("filename_suffix") or "")
+    if not suffix:
+        return None
+    wind_path = Path(json_dir) / f"{mesh_name}{suffix}"
+    if not wind_path.is_file():
+        return None
+    return wind_path.resolve().as_posix()
+
+
 def _write_pipeline_sidecar(
     json_dir,
     mesh_name,
@@ -85,12 +130,25 @@ def _write_pipeline_sidecar(
     data = {
         "schema_version": 3,
         "material_pipeline": "surface_layers",
-        "material_master": "prop",
+        "material_master": _material_master_for_entries(material_entries),
         "mesh_name": mesh_name,
         "asset_prefix": prefix,
         "materials": material_entries,
         "cleanup": _cleanup_json_entry(material_entries),
     }
+    speedtree_descriptor = _speedtree_sidecar_descriptor(
+        material_entries,
+        mesh_name,
+    )
+    if speedtree_descriptor is not None:
+        data["speedtree_handoff_contract"] = speedtree_descriptor
+    dynamic_wind_path = _speedtree_dynamic_wind_path(
+        json_dir,
+        mesh_name,
+        speedtree_descriptor,
+    )
+    if dynamic_wind_path is not None:
+        data["dynamic_wind_json"] = dynamic_wind_path
     if validation is not None:
         data["validation"] = validation
     if validation_children:
@@ -367,6 +425,25 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
         if not clean_token(material.name).startswith(MATERIAL_PREFIX):
             errors.append(
                 f"Material '{material.name}' must use the {MATERIAL_PREFIX} prefix. Used by: {usage}."
+            )
+
+        try:
+            if master_preset_for_material(material) == "tree":
+                instance_profile = _unreal_instance_profile(material)
+                _speedtree_material_intent(
+                    material,
+                    instance_profile=instance_profile,
+                )
+                if instance_profile and is_translucent_material(material):
+                    errors.append(
+                        f"Tree material '{material.name}' cannot combine a "
+                        "translucent handoff with unreal_instance_profile. "
+                        f"Used by: {usage}."
+                    )
+        except ValueError as exc:
+            errors.append(
+                f"Invalid SpeedTree handoff for material '{material.name}': "
+                f"{exc}. Used by: {usage}."
             )
 
         textures = texture_map.get(material, {})

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Unreal Handoff Validator",
     "author": "Codex",
-    "version": (2, 8, 1),
+    "version": (2, 8, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Unreal Handoff",
     "description": "Validate Blender-to-Unreal handoff data and write the Unreal postprocess manifest.",
@@ -27,9 +27,11 @@ from .operators import (
 )
 from .pipeline_json import _json_refresh_validation_errors, write_unreal_pipeline_json
 from .painter_sync import (
+    reset_painter_export_sync_state,
     sync_painter_export_deferred,
     sync_painter_export_on_depsgraph,
     sync_painter_export_on_load,
+    sync_painter_export_on_undo_redo,
 )
 from .properties import UEUN_PG_settings
 from .ui import UEUN_PT_panel
@@ -68,6 +70,7 @@ def schedule_n_panel_sub_tabs_refresh():
 
 
 def register():
+    reset_painter_export_sync_state()
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ue_unique_names = bpy.props.PointerProperty(type=UEUN_PG_settings)
@@ -87,14 +90,21 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(
             sync_painter_export_on_depsgraph
         )
+    if sync_painter_export_on_undo_redo not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(sync_painter_export_on_undo_redo)
+    if sync_painter_export_on_undo_redo not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(sync_painter_export_on_undo_redo)
     if not bpy.app.timers.is_registered(sync_painter_export_deferred):
         bpy.app.timers.register(sync_painter_export_deferred, first_interval=0.1)
     schedule_n_panel_sub_tabs_refresh()
 
 
 def unregister():
-    if bpy.app.timers.is_registered(sync_painter_export_deferred):
-        bpy.app.timers.unregister(sync_painter_export_deferred)
+    reset_painter_export_sync_state()
+    if sync_painter_export_on_undo_redo in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(sync_painter_export_on_undo_redo)
+    if sync_painter_export_on_undo_redo in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(sync_painter_export_on_undo_redo)
     if sync_painter_export_on_depsgraph in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
             sync_painter_export_on_depsgraph
