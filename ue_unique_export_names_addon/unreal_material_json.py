@@ -62,9 +62,6 @@ TREE_LAYER_PARENT_BY_PART = {
 }
 TREE_LAYER_INSTANCE_FOLDER = "/Game/Material/Tree/AssetTree/MYI"
 TREE_IGNORED_TEXTURE_PARAMS = {
-    "alpha",
-    "opacity",
-    "opacity map",
     "transmission",
 }
 TREE_BASE_COLOR_SUFFIXES = (
@@ -78,6 +75,11 @@ TREE_SUBSURFACE_SOURCE_SUFFIXES = (
     "_subsurface",
     "_subsurfacecolor",
     "_translucency",
+)
+TREE_OPACITY_SOURCE_SUFFIXES = (
+    "_opacity",
+    "_opacitymap",
+    "_alpha",
 )
 UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
@@ -326,6 +328,7 @@ COMMON_TEXTURE_PARAM_BY_LAYER_PARAM = {
     "Extra": "Extra",
     "Normal": "Normal",
     "Height": "Height",
+    "Opacity Map": "Opacity Map",
     "Transmission": "Transmission",
     "Emissive": "Emissive",
     "Moss Blend Mask": "Moss Blend Mask",
@@ -361,6 +364,7 @@ def _texture_param_map_for_material_layer_preset(key):
     if key == "tree":
         mapping = _texture_param_map()
         mapping.pop("Transmission", None)
+        mapping["Opacity Map"] = "Opacity Map"
         mapping["Subsurface"] = "Subsurface"
         return mapping
     return _texture_param_map()
@@ -439,6 +443,8 @@ def _texture_json_entry(role, image, param=None):
     }
     if param and param != role:
         entry["source_param"] = role
+    if (param or role) == "Opacity Map":
+        entry["virtual_texture_streaming"] = False
     return entry
 
 
@@ -446,11 +452,14 @@ def _texture_json_entry_from_path(param, source_path):
     source_path = Path(source_path)
     clean_name = clean_token(source_path.stem)
     asset_name = clean_name if clean_name.startswith(TEXTURE_PREFIX) else f"{TEXTURE_PREFIX}{clean_name}"
-    return {
+    entry = {
         "param": param,
         "asset_name": asset_name,
         "file": source_path.as_posix(),
     }
+    if param == "Opacity Map":
+        entry["virtual_texture_streaming"] = False
+    return entry
 
 
 def texture_asset_name_for_image(image, source_path=None):
@@ -473,13 +482,24 @@ def _tree_texture_param_allowed(param, tree_shading):
 
 
 def _tree_texture_role_is_excluded(role, tree_shading):
+    layer_param = _tree_layer_param_for_role(role)
     return not (
         _tree_texture_param_allowed(role, tree_shading)
         and _tree_texture_param_allowed(
-            surface_layer_param_for_role(role),
+            layer_param,
             tree_shading,
         )
     )
+
+
+def _tree_layer_param_for_role(role):
+    if str(role or "").strip().casefold() in {
+        "alpha",
+        "opacity",
+        "opacity map",
+    }:
+        return "Opacity Map"
+    return surface_layer_param_for_role(role)
 
 
 def _subsurface_sibling_path(source_path):
@@ -537,18 +557,92 @@ def _tree_subsurface_path(mat, texture_map, tree_shading):
     return None
 
 
+def _tree_texture_sibling_path(source_path, suffixes):
+    source_path = Path(source_path)
+    stem_lower = source_path.stem.casefold()
+    base_stem = None
+    for suffix in TREE_BASE_COLOR_SUFFIXES:
+        if stem_lower.endswith(suffix):
+            base_stem = source_path.stem[:-len(suffix)]
+            break
+    if not base_stem:
+        return None
+
+    extensions = [source_path.suffix, ".tga", ".png", ".tif", ".tiff", ".exr"]
+    for source_suffix in suffixes:
+        seen_extensions = set()
+        for extension in extensions:
+            extension_key = extension.casefold()
+            if not extension or extension_key in seen_extensions:
+                continue
+            seen_extensions.add(extension_key)
+            candidate = source_path.with_name(f"{base_stem}{source_suffix}{extension}")
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def _tree_opacity_path(mat, texture_map):
+    material_textures = list(texture_map.get(mat, {}).items())
+    for role, image in material_textures:
+        source_path = image_disk_path(image)
+        if not source_path or not source_path.is_file():
+            continue
+        role_key = str(role or "").strip().casefold()
+        stem_key = source_path.stem.casefold()
+        if role_key in {"alpha", "opacity", "opacity map"} or stem_key.endswith(
+            TREE_OPACITY_SOURCE_SUFFIXES
+        ):
+            return source_path
+
+    for role, image in material_textures:
+        if str(_tree_layer_param_for_role(role)).casefold() != "albedo":
+            continue
+        source_path = image_disk_path(image)
+        if not source_path:
+            continue
+        sibling_path = _tree_texture_sibling_path(
+            source_path,
+            TREE_OPACITY_SOURCE_SUFFIXES,
+        )
+        if sibling_path:
+            return sibling_path
+    return None
+
+
+def _canonical_tree_texture_param(role, image):
+    source_path = image_disk_path(image)
+    if source_path and source_path.stem.casefold().endswith(
+        TREE_OPACITY_SOURCE_SUFFIXES
+    ):
+        return "Opacity Map"
+    if str(role or "").strip().casefold() in {
+        "alpha",
+        "opacity",
+        "opacity map",
+    }:
+        return "Opacity Map"
+    return str(role)
+
+
 def _tree_texture_json_entries(mat, texture_map, tree_shading):
     textures = []
     seen_params = set()
     for role, image in texture_map.get(mat, {}).items():
         if _tree_texture_role_is_excluded(role, tree_shading):
             continue
-        param = str(role)
+        param = _canonical_tree_texture_param(role, image)
         if param in seen_params:
             continue
         seen_params.add(param)
-        textures.append(_texture_json_entry(role, image))
+        textures.append(_texture_json_entry(role, image, param=param))
 
+    opacity_path = _tree_opacity_path(mat, texture_map)
+    if opacity_path and "Opacity Map" not in seen_params:
+        entry = _texture_json_entry_from_path("Opacity Map", opacity_path)
+        entry["virtual_texture_streaming"] = False
+        textures.append(entry)
+        seen_params.add("Opacity Map")
     subsurface_path = _tree_subsurface_path(mat, texture_map, tree_shading)
     if subsurface_path and "Subsurface" not in seen_params:
         textures.append(_texture_json_entry_from_path("Subsurface", subsurface_path))
@@ -566,12 +660,24 @@ def _material_layer_json_entries(
     for role, image in texture_map.get(mat, {}).items():
         if master_preset == "tree" and _tree_texture_role_is_excluded(role, tree_shading):
             continue
-        param = surface_layer_param_for_role(role)
+        param = (
+            _tree_layer_param_for_role(role)
+            if master_preset == "tree"
+            else surface_layer_param_for_role(role)
+        )
+        if master_preset == "tree":
+            param = _canonical_tree_texture_param(param, image)
         if param in seen_params:
             continue
         seen_params.add(param)
         textures.append(_texture_json_entry(role, image, param=param))
     if master_preset == "tree":
+        opacity_path = _tree_opacity_path(mat, texture_map)
+        if opacity_path and "Opacity Map" not in seen_params:
+            entry = _texture_json_entry_from_path("Opacity Map", opacity_path)
+            entry["virtual_texture_streaming"] = False
+            textures.append(entry)
+            seen_params.add("Opacity Map")
         subsurface_path = _tree_subsurface_path(mat, texture_map, tree_shading)
         if subsurface_path and "Subsurface" not in seen_params:
             textures.append(_texture_json_entry_from_path("Subsurface", subsurface_path))

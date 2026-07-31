@@ -12,6 +12,7 @@ from .gpro import (
     material_usage_text,
     unreal_handoff_material_slot_entries,
 )
+from .naming import top_empty_parent
 from .transfer import transfer_postprocess_entry
 from .unreal_material_json import (
     _material_json_entry,
@@ -23,6 +24,44 @@ from .unreal_material_json import (
 from .utils import clean_token, export_collection
 from .validation import export_validation_rows
 from .validation import _hair_asset_validation_row
+
+
+def _asset_unit_groups(context, objects):
+    """Group mesh objects by the asset root Send to Unreal will name.
+
+    Send to Unreal can use the highest Empty in the Export collection as the
+    asset name even when an Armature (or another in-scope object) sits between
+    that Empty and the mesh.  Direct-parent-only grouping therefore produces a
+    sidecar for the child mesh name instead of the imported asset name.
+    """
+    objects = list(objects)
+    export_coll = export_collection(context)
+    scope_objects = set(export_coll.all_objects) if export_coll else set()
+
+    # Selected/scene workflows can contain objects outside the Export
+    # collection.  Their own parent chains are still a valid naming scope.
+    for obj in objects:
+        if obj in scope_objects:
+            continue
+        scope_objects.add(obj)
+        parent = obj.parent
+        while parent is not None:
+            scope_objects.add(parent)
+            parent = parent.parent
+
+    standalone = []
+    groups_by_root = {}
+    roots_in_order = []
+    for obj in objects:
+        root = top_empty_parent(obj, scope_objects)
+        if root is None:
+            standalone.append(obj)
+            continue
+        if root not in groups_by_root:
+            groups_by_root[root] = []
+            roots_in_order.append(root)
+        groups_by_root[root].append(obj)
+    return standalone, [(root, groups_by_root[root]) for root in roots_in_order]
 
 
 def _append_unique_name(target, seen, name):
@@ -175,7 +214,6 @@ def write_unreal_pipeline_json(
     hair_assets = list(hair_assets or [])
     json_dir.mkdir(parents=True, exist_ok=True)
     json_paths = []
-    object_names = {clean_token(obj.name) for obj in objects}
     validation_rows = export_validation_rows(
         context,
         objects=objects,
@@ -196,13 +234,12 @@ def write_unreal_pipeline_json(
         for asset in hair_assets
     }
     written_target_names = set()
+    standalone_objects, asset_unit_groups = _asset_unit_groups(context, objects)
 
     if not combined_only:
-        # Per standalone mesh-object sidecar. Child meshes under an Empty export
-        # as the Empty/group asset, so their contract lives in the Empty JSON.
-        for obj in objects:
-            if obj.parent and obj.parent.type == "EMPTY":
-                continue
+        # Meshes belonging to an Empty asset unit use the Empty JSON even when
+        # an Armature or another in-scope object sits between them.
+        for obj in standalone_objects:
             mesh_name = clean_token(obj.name)
             entries = []
             seen_materials = set()
@@ -226,30 +263,18 @@ def write_unreal_pipeline_json(
             )
             written_target_names.add(mesh_name)
 
-    # 2) Per EMPTY-parent sidecar. Send to Unreal "Combine > Child meshes" merges an empty's child
-    #    meshes into ONE asset named after the empty (combine_assets.py pre_mesh_export), so without
-    #    this the combined mesh has no matching <name>.json and its materials break. We aggregate all
-    #    child materials (unique, first-encounter order). The Unreal side matches slots by material
-    #    name, so slot_index here is only a best-effort hint for the combined slot order.
-    children_by_empty = {}
-    empties_in_order = []
-    for obj in objects:
-        parent = obj.parent
-        if parent and parent.type == "EMPTY":
-            if parent.name not in children_by_empty:
-                children_by_empty[parent.name] = []
-                empties_in_order.append(parent)
-            children_by_empty[parent.name].append(obj)
-
-    for empty in empties_in_order:
+    # 2) Per Empty asset-unit sidecar. Send to Unreal names/combines the unit by
+    # its highest Empty, so aggregate all descendant mesh materials in order.
+    standalone_names = {clean_token(obj.name) for obj in standalone_objects}
+    for empty, unit_objects in asset_unit_groups:
         empty_name = clean_token(empty.name)
-        # If a mesh object already owns this name, its per-object sidecar wins — don't clobber it.
-        if empty_name in object_names:
+        # A genuinely standalone mesh with this name already owns the sidecar.
+        if empty_name in standalone_names:
             continue
         entries = []
         seen_materials = set()
         slot_index = 0
-        for obj in children_by_empty[empty.name]:
+        for obj in unit_objects:
             for _source_slot_index, mat, _location in unreal_handoff_material_slot_entries(obj):
                 if (
                     not mat
@@ -262,7 +287,7 @@ def write_unreal_pipeline_json(
         if entries:
             child_validation = [
                 validation_by_object_name[obj.name]
-                for obj in children_by_empty[empty.name]
+                for obj in unit_objects
                 if obj.name in validation_by_object_name
             ]
             hair_asset = hair_assets_by_name.get(empty_name)
@@ -285,7 +310,7 @@ def write_unreal_pipeline_json(
                     validation_children=child_validation,
                     transfer_sources=[
                         transfer_postprocess_entry(obj)
-                        for obj in children_by_empty[empty.name]
+                        for obj in unit_objects
                     ],
                 )
             )
@@ -312,20 +337,27 @@ def write_unreal_pipeline_json(
             written_target_names.add(mesh_name)
 
     if json_paths:
-        cleanup_stale_pipeline_sidecars(json_dir, objects, json_paths, hair_assets=hair_assets)
+        cleanup_stale_pipeline_sidecars(
+            context,
+            json_dir,
+            objects,
+            json_paths,
+            hair_assets=hair_assets,
+        )
         context.scene.ue_unique_names.last_pipeline_json_path = str(json_paths[-1])
     return json_paths
 
 
-def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths, hair_assets=None):
+def cleanup_stale_pipeline_sidecars(context, json_dir, objects, keep_paths, hair_assets=None):
     hair_assets = list(hair_assets or [])
     keep = {Path(path).resolve() for path in keep_paths}
     candidate_names = {clean_token(obj.name) for obj in objects}
     candidate_names.update(clean_token(asset["asset_name"]) for asset in hair_assets)
-    for obj in objects:
-        parent = obj.parent
-        if parent and parent.type == "EMPTY":
-            candidate_names.add(clean_token(parent.name))
+    _standalone, asset_unit_groups = _asset_unit_groups(context, objects)
+    candidate_names.update(
+        clean_token(root.name)
+        for root, _unit_objects in asset_unit_groups
+    )
     for name in candidate_names:
         path = (json_dir / f"{name}.json").resolve()
         if path in keep or not path.exists():
@@ -336,29 +368,16 @@ def cleanup_stale_pipeline_sidecars(json_dir, objects, keep_paths, hair_assets=N
             pass
 
 
-def _json_target_names(objects, combined_only=False, hair_assets=None):
+def _json_target_names(objects, combined_only=False, hair_assets=None, context=None):
     hair_assets = list(hair_assets or [])
     names = []
+    standalone_objects, asset_unit_groups = _asset_unit_groups(context, objects)
     if not combined_only:
-        names.extend(
-            obj.name
-            for obj in objects
-            if not (obj.parent and obj.parent.type == "EMPTY")
-        )
+        names.extend(obj.name for obj in standalone_objects)
 
-    object_names = {clean_token(obj.name) for obj in objects}
-    children_by_empty = {}
-    empties_in_order = []
-    for obj in objects:
-        parent = obj.parent
-        if parent and parent.type == "EMPTY":
-            if parent.name not in children_by_empty:
-                children_by_empty[parent.name] = []
-                empties_in_order.append(parent)
-            children_by_empty[parent.name].append(obj)
-
-    for empty in empties_in_order:
-        if clean_token(empty.name) in object_names:
+    standalone_names = {clean_token(obj.name) for obj in standalone_objects}
+    for empty, _unit_objects in asset_unit_groups:
+        if clean_token(empty.name) in standalone_names:
             continue
         names.append(empty.name)
     existing_names = {clean_token(name) for name in names}
@@ -395,7 +414,11 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
     if not materials:
         errors.append("No materials found in the selected JSON scope.")
 
-    target_names = _json_target_names(objects, hair_assets=hair_assets)
+    target_names = _json_target_names(
+        objects,
+        hair_assets=hair_assets,
+        context=context,
+    )
     for name in target_names:
         _validate_clean_name("JSON target", name, errors)
     duplicated_targets = sorted(

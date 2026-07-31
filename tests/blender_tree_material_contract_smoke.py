@@ -138,19 +138,45 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
     assert leaf_entry["material_layer"]["tree_part"] == "leaf"
     assert leaf_entry["material_layer"]["parent"] == TREE_LAYER_PARENT_BY_PART["leaf"]
     assert "Subsurface" in leaf_entry["material_layer"]["texture_remap"]
+    assert leaf_entry["material_layer"]["texture_remap"]["Opacity Map"] == "Opacity Map"
     assert "Transmission" not in leaf_entry["material_layer"]["texture_remap"]
-    assert _params(leaf_entry["textures"]) == {"BaseColor", "Subsurface"}
-    assert _params(leaf_entry["layers"][0]["textures"]) == {"Albedo", "Subsurface"}
+    assert _params(leaf_entry["textures"]) == {
+        "BaseColor",
+        "Opacity Map",
+        "Subsurface",
+    }
+    assert _params(leaf_entry["layers"][0]["textures"]) == {
+        "Albedo",
+        "Opacity Map",
+        "Subsurface",
+    }
+    assert next(
+        texture for texture in leaf_entry["layers"][0]["textures"]
+        if texture["param"] == "Opacity Map"
+    )["virtual_texture_streaming"] is False
     assert next(
         texture for texture in leaf_entry["textures"]
         if texture["param"] == "Subsurface"
     )["file"] == subsurface_path.as_posix()
 
+    sibling_opacity_leaf = bpy.data.materials.new(
+        "M_leaf_sibling_opacity_contract"
+    )
+    sibling_opacity_entry = _material_json_entry(
+        sibling_opacity_leaf,
+        1,
+        {sibling_opacity_leaf: {"BaseColor": color_image}},
+    )
+    assert next(
+        texture for texture in sibling_opacity_entry["layers"][0]["textures"]
+        if texture["param"] == "Opacity Map"
+    )["file"] == opacity_path.as_posix()
+
     leaf_without_subsurface = bpy.data.materials.new("M_leaf_missing_subsurface_contract")
     missing_color_image = _image("Missing Subsurface Color", missing_color_path)
     leaf_without_subsurface_entry = _material_json_entry(
         leaf_without_subsurface,
-        1,
+        2,
         {
             leaf_without_subsurface: {
                 "BaseColor": missing_color_image,
@@ -158,14 +184,20 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
             }
         },
     )
-    assert _params(leaf_without_subsurface_entry["textures"]) == {"BaseColor"}
-    assert _params(leaf_without_subsurface_entry["layers"][0]["textures"]) == {"Albedo"}
+    assert _params(leaf_without_subsurface_entry["textures"]) == {
+        "BaseColor",
+        "Opacity Map",
+    }
+    assert _params(leaf_without_subsurface_entry["layers"][0]["textures"]) == {
+        "Albedo",
+        "Opacity Map",
+    }
 
     translucency_leaf = bpy.data.materials.new("M_leaf_translucency_contract")
     translucency_color_image = _image("Translucency Color", translucency_color_path)
     translucency_leaf_entry = _material_json_entry(
         translucency_leaf,
-        2,
+        3,
         {translucency_leaf: {"BaseColor": translucency_color_image}},
     )
     translucency_texture = next(
@@ -201,8 +233,16 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
         "/MYI_stem_subsurface_contract"
     )
     assert stem_entry["material_layer"]["parent"] == TREE_LAYER_PARENT_BY_PART["branch"]
-    assert _params(stem_entry["textures"]) == {"BaseColor", "Subsurface"}
-    assert _params(stem_entry["layers"][0]["textures"]) == {"Albedo", "Subsurface"}
+    assert _params(stem_entry["textures"]) == {
+        "BaseColor",
+        "Opacity Map",
+        "Subsurface",
+    }
+    assert _params(stem_entry["layers"][0]["textures"]) == {
+        "Albedo",
+        "Opacity Map",
+        "Subsurface",
+    }
 
     woody_branch = bpy.data.materials.new("M_branch_woody_contract")
     woody_branch_entry = _material_json_entry(
@@ -217,7 +257,10 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
     )
     assert woody_branch_entry["tree_part"] == "branch"
     assert woody_branch_entry["tree_shading"] == "wood"
-    assert _params(woody_branch_entry["textures"]) == {"BaseColor"}
+    assert _params(woody_branch_entry["textures"]) == {
+        "BaseColor",
+        "Opacity Map",
+    }
 
     explicit_wood_stem = bpy.data.materials.new("M_stem_explicit_wood_contract")
     explicit_wood_stem["unreal_tree_shading"] = "wood"
@@ -227,10 +270,14 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
         {explicit_wood_stem: {"BaseColor": color_image, "Subsurface": subsurface_image}},
     )
     assert explicit_wood_entry["tree_shading"] == "wood"
-    assert _params(explicit_wood_entry["textures"]) == {"BaseColor"}
+    assert _params(explicit_wood_entry["textures"]) == {
+        "BaseColor",
+        "Opacity Map",
+    }
 
-    for excluded_param in ("Alpha", "Opacity", "Opacity Map", "Transmission"):
-        assert _tree_texture_role_is_excluded(excluded_param, "foliage")
+    for allowed_param in ("Alpha", "Opacity", "Opacity Map"):
+        assert not _tree_texture_role_is_excluded(allowed_param, "foliage")
+    assert _tree_texture_role_is_excluded("Transmission", "foliage")
     assert _tree_texture_role_is_excluded("Subsurface", "wood")
     assert not _tree_texture_role_is_excluded("Subsurface", "foliage")
     assert _material_instance_base_name("M_stem_common_01_Mat.001") == (
