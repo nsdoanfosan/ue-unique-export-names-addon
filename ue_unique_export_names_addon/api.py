@@ -5,15 +5,22 @@ from pathlib import Path
 import bpy
 
 from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
-from .naming import material_texture_map, resolve_export_dir
+from .naming import material_texture_map, resolve_export_dir, top_empty_parent
 from .pipeline_json import _json_refresh_validation_errors, write_unreal_pipeline_json
-from .utils import asset_prefix, hair_tool_asset_groups, validation_scope_objects
+from .utils import (
+    asset_prefix,
+    clean_token,
+    export_collection,
+    hair_tool_asset_groups,
+    validation_scope_objects,
+)
 
 __all__ = (
     "collect_handoff_data",
     "validate_handoff",
     "refresh_handoff_json",
     "resolve_export_directory",
+    "resolve_asset_unit_name",
     "resolve_sidecar_json_path",
 )
 
@@ -26,11 +33,12 @@ def _props(context):
     return context.scene.ue_unique_names
 
 
-def collect_handoff_data(context=None):
+def collect_handoff_data(context=None, scope=None):
     context = _context(context)
     props = _props(context)
-    objects = validation_scope_objects(context, props.scope)
-    hair_assets = hair_tool_asset_groups(context, props.scope)
+    effective_scope = scope or props.scope
+    objects = validation_scope_objects(context, effective_scope)
+    hair_assets = hair_tool_asset_groups(context, effective_scope)
     materials = unreal_handoff_materials_from_objects(objects)
     seen_materials = {material.name for material in materials}
     for asset in hair_assets:
@@ -45,6 +53,7 @@ def collect_handoff_data(context=None):
     return {
         "context": context,
         "props": props,
+        "scope": effective_scope,
         "objects": objects,
         "hair_assets": hair_assets,
         "materials": materials,
@@ -52,8 +61,8 @@ def collect_handoff_data(context=None):
     }
 
 
-def validate_handoff(context=None):
-    data = collect_handoff_data(context)
+def validate_handoff(context=None, scope=None):
+    data = collect_handoff_data(context, scope=scope)
     data["errors"] = _json_refresh_validation_errors(
         data["context"],
         data["props"],
@@ -65,8 +74,8 @@ def validate_handoff(context=None):
     return data
 
 
-def refresh_handoff_json(context=None):
-    data = validate_handoff(context)
+def refresh_handoff_json(context=None, scope=None):
+    data = validate_handoff(context, scope=scope)
     props = data["props"]
     export_dir = resolve_export_dir(props.texture_export_dir)
     data["export_dir"] = str(export_dir)
@@ -91,6 +100,23 @@ def refresh_handoff_json(context=None):
 def resolve_export_directory(context=None):
     props = _props(_context(context))
     return str(resolve_export_dir(props.texture_export_dir))
+
+
+def resolve_asset_unit_name(obj, context=None):
+    """Return the asset name Send to Unreal derives for a mesh object."""
+    if obj is None:
+        return ""
+    context = _context(context)
+    collection = export_collection(context)
+    scope_objects = set(collection.all_objects) if collection else set()
+    if obj not in scope_objects:
+        scope_objects.add(obj)
+        parent = obj.parent
+        while parent is not None:
+            scope_objects.add(parent)
+            parent = parent.parent
+    root = top_empty_parent(obj, scope_objects)
+    return clean_token((root or obj).name)
 
 
 def _asset_name_from_value(value):

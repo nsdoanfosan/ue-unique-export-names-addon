@@ -82,11 +82,7 @@ def scope_objects_for_validation(context, scope):
         coll = export_collection(context)
         if not coll:
             return []
-        return [
-            obj
-            for obj in coll.all_objects
-            if coll in obj.users_collection and obj.visible_get()
-        ]
+        return [obj for obj in coll.all_objects if obj.visible_get()]
     return [obj for obj in context.scene.objects if obj.visible_get()]
 
 

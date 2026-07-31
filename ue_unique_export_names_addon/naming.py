@@ -9,6 +9,7 @@ from .constants import (
     BACKUP_FILEPATH_RAW_PROP,
     BACKUP_PROP,
     MATERIAL_PREFIX,
+    PAINTER_ROLE_NAMES,
     TEXTURE_PREFIX,
     ROLE_BY_BSDF_INPUT,
     ROLE_PRIORITY,
@@ -444,9 +445,8 @@ def top_empty_parent(obj, scope_objects):
     top = None
     parent = obj.parent
     while parent is not None and parent in scope_objects:
-        if parent.type != "EMPTY":
-            break
-        top = parent
+        if parent.type == "EMPTY":
+            top = parent
         parent = parent.parent
     return top
 

@@ -258,12 +258,11 @@ def draw_export_transfer_source(layout, context):
 
 
 def draw_external_workflow_preview(layout, context, props):
-    objects, painter_objects, _protected = mutation_safe_mesh_objects(context, props.scope)
-    selected_objects, selected_painter_objects, _selected_protected = mutation_safe_mesh_objects(
+    objects, painter_objects, _protected = mutation_safe_mesh_objects(
         context, "SELECTED"
     )
     rows = external_workflow_preview_rows(
-        context, props, selected_objects, scope="SELECTED"
+        context, props, objects, scope="SELECTED"
     )
     total = len(objects) + len(painter_objects)
     layout.label(
@@ -279,9 +278,9 @@ def draw_external_workflow_preview(layout, context, props):
     preview.label(text="Selected mesh rename preview", icon="VIEWZOOM")
     if not rows:
         preview.label(text="Select mesh objects to preview rename.", icon="ERROR")
-    if selected_painter_objects:
+    if painter_objects:
         preview.label(
-            text=f"Protected selected meshes skipped {len(selected_painter_objects)}",
+            text=f"Protected selected meshes skipped {len(painter_objects)}",
             icon="INFO",
         )
     for row_data in rows[:8]:

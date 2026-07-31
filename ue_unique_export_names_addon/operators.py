@@ -9,6 +9,7 @@ from .constants import CREATED_EMPTY_PROP
 from .armature_repair import prepare_scope_armatures
 from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
 from .materials import (
+    external_data_shared_outside_objects,
     external_materials_from_objects,
     mutation_safe_mesh_objects,
     protected_painter_data,
@@ -43,7 +44,7 @@ from .pipeline_json import (
     write_unreal_pipeline_json,
 )
 from .spreadsheet import open_validation_spreadsheet_window
-from .utils import asset_prefix, export_collection, hair_tool_asset_groups, validation_scope_objects
+from .utils import asset_prefix, hair_tool_asset_groups, validation_scope_objects
 from .validation import (
     export_validation_rows,
     grouped_validation_rows,
@@ -122,23 +123,30 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.ue_unique_names
         prefix = asset_prefix(context, props.prefix_mode, props.custom_prefix)
+        external_scope = "SELECTED"
         objects, skipped_objects, protected = mutation_safe_mesh_objects(
-            context, props.scope
+            context, external_scope
         )
         if not objects:
-            if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
-                self.report(
-                    {"WARNING"},
-                    "'Export' 콜렉션을 찾지 못했습니다 — Scope가 Export Collection입니다 "
-                    "(no 'Export' collection found; Scope = Export Collection).",
-                )
-            else:
-                self.report({"WARNING"}, "대상 메쉬가 없습니다 (no mesh objects found).")
+            self.report({"WARNING"}, "Select one or more external mesh objects.")
             return {"CANCELLED"}
 
         materials, skipped_materials = external_materials_from_objects(
             context, objects, protected
         )
+        shared = external_data_shared_outside_objects(context, materials, objects)
+        if shared["materials"] or shared["images"]:
+            labels = [
+                *(f"material {material.name}" for material in shared["materials"]),
+                *(f"image {image.name}" for image in shared["images"]),
+            ]
+            self.report(
+                {"ERROR"},
+                "Selected-only External workflow blocked because data is shared "
+                "with unselected meshes. Make it single-user first: "
+                + ", ".join(labels[:8]),
+            )
+            return {"CANCELLED"}
         if not materials:
             self.report(
                 {"WARNING"},
@@ -251,7 +259,7 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
         pipeline_json_paths = []
         if props.write_manifest and props.texture_handling == "WRITE_FILES":
             manifest_path = write_manifest(context, prefix, objects, materials, texture_map, export_dir)
-            hair_assets = hair_tool_asset_groups(context, props.scope)
+            hair_assets = hair_tool_asset_groups(context, external_scope)
             pipeline_json_paths = write_unreal_pipeline_json(
                 context,
                 prefix,
@@ -583,14 +591,23 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
         if not objects:
             self.report({"WARNING"}, "Select one or more mesh objects to rename.")
             return {"CANCELLED"}
-            if props.scope == "EXPORT_COLLECTION" and export_collection(context) is None:
-                self.report(
-                    {"WARNING"},
-                    "'Export' 콜렉션을 찾지 못했습니다 — Scope가 Export Collection입니다 "
-                    "(no 'Export' collection found; Scope = Export Collection).",
-                )
-            else:
-                self.report({"WARNING"}, "대상 메쉬가 없습니다 (no mesh objects found).")
+
+        target_objects = set(objects)
+        outside_mesh_data = {
+            obj.data
+            for obj in context.scene.objects
+            if obj.type == "MESH" and obj not in target_objects and obj.data is not None
+        }
+        shared_mesh_objects = [
+            obj for obj in objects if obj.data is not None and obj.data in outside_mesh_data
+        ]
+        if shared_mesh_objects:
+            self.report(
+                {"ERROR"},
+                "Selected-only mesh rename blocked because mesh data is shared "
+                "with unselected objects. Make it single-user first: "
+                + ", ".join(obj.name for obj in shared_mesh_objects[:8]),
+            )
             return {"CANCELLED"}
 
         units = export_naming_units(context, "SELECTED", objects)
@@ -666,17 +683,6 @@ class UEUN_OT_prepare_mesh_names(bpy.types.Operator):
         self.report({"INFO"}, message + ". (.blend file not saved)")
         return {"FINISHED"}
 
-        self.report(
-            {"INFO"},
-            f"완료 (done): Export 단위 {len(units)}개 · 메쉬 이름 {renamed_meshes}개 정리"
-            + (
-                f" · 보호 데이터 공유 메쉬 {len(skipped_objects)}개 제외"
-                if skipped_objects else ""
-            )
-            + ". (.blend 저장 안 됨 / file not saved)",
-        )
-        return {"FINISHED"}
-
 class UEUN_OT_prepare_external_asset(bpy.types.Operator):
     bl_idname = "ue_unique_names.prepare_external_asset"
     bl_label = "Prepare External Textures"
@@ -687,22 +693,14 @@ class UEUN_OT_prepare_external_asset(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        armature_result = bpy.ops.ue_unique_names.prepare_armatures()
-        if "FINISHED" not in armature_result:
-            self.report(
-                {"ERROR"},
-                "Armature preparation failed; external workflow stopped.",
-            )
+        selected_objects, _skipped_objects, _protected = mutation_safe_mesh_objects(
+            context, "SELECTED"
+        )
+        if not selected_objects:
+            self.report({"WARNING"}, "Select one or more external mesh objects.")
             return {"CANCELLED"}
 
-        mesh_result = {"FINISHED"}
-        if "FINISHED" not in mesh_result:
-            self.report(
-                {"ERROR"},
-                "메쉬 이름 준비에 실패해 External 작업을 중단했습니다 "
-                "(mesh naming failed; external workflow stopped).",
-            )
-            return {"CANCELLED"}
+        prepare_scope_armatures(context, "SELECTED")
 
         texture_result = bpy.ops.ue_unique_names.prepare()
         if "FINISHED" not in texture_result:
@@ -712,24 +710,10 @@ class UEUN_OT_prepare_external_asset(bpy.types.Operator):
                 "by this operator.",
             )
             return {"CANCELLED"}
-            self.report(
-                {"ERROR"},
-                "메쉬 이름은 변경됐지만 텍스처 준비에 실패했습니다. "
-                "필요하면 Restore Original Names로 되돌리세요 "
-                "(mesh names changed, texture preparation failed).",
-            )
-            return {"CANCELLED"}
 
         self.report(
             {"INFO"},
             "External texture workflow complete. Mesh renaming remains a separate "
             "preview-confirmed step.",
-        )
-        return {"FINISHED"}
-
-        self.report(
-            {"INFO"},
-            "External 작업 완료: 메쉬 이름 정리 후 텍스처를 정리했습니다 "
-            "(mesh names first, textures second).",
         )
         return {"FINISHED"}
