@@ -14,8 +14,8 @@ from ue_unique_export_names_addon import unreal_material_json
 material = bpy.data.materials.new("M_HT_Default_Material_01")
 material.use_nodes = True
 contract = {
-    "schema": "htue.material.v2",
-    "version": 2,
+    "schema": "htue.material.v3",
+    "version": 3,
     "material_instance_path": "/Game/Material/HairTool/MI/MI_HT_Default_Material_01",
     "create_if_missing": False,
     "manage_existing_material_instance": True,
@@ -29,11 +29,19 @@ contract = {
         }
     ],
     "hair_tool": {
-        "contract_version": 2,
+        "contract_version": 3,
         "control_source_material": material.name,
-        "sync_parameters": ["System Color 01", "System Blend Mode"],
-        "vector_parameters": {"System Color 01": [0.1, 0.2, 0.3, 1.0]},
-        "scalar_parameters": {"System Blend Mode": 2.0},
+        "sync_parameters": ["System Color Influence", "System Blend Mode"],
+        "vector_parameters": {},
+        "vertex_uv_payload": {
+            "version": 3,
+            "encoding": "HTUE_RGB_TAGGED_UV",
+            "system_color_alpha_used": False,
+        },
+        "scalar_parameters": {
+            "System Color Influence": 1.0,
+            "System Blend Mode": 2.0,
+        },
     },
 }
 material["htue_contract_json"] = json.dumps(contract)

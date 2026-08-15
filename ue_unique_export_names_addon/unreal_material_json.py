@@ -28,8 +28,8 @@ HAIR_TEXTURE_SUFFIXES = {
     "Opacity Map": "Opacity",
 }
 HTUE_CONTRACT_PROPERTY = "htue_contract_json"
-HTUE_CONTRACT_SCHEMA = "htue.material.v2"
-HTUE_CONTRACT_VERSION = 2
+HTUE_CONTRACT_SCHEMA = "htue.material.v3"
+HTUE_CONTRACT_VERSION = 3
 TREE_PART_ALIASES = {
     "leaf": "leaf",
     "leaves": "leaf",
@@ -289,13 +289,25 @@ def _hair_tool_json(mat):
     root_color = _hair_socket_value(node, "Root Color", [0.0, 0.0, 0.0, 1.0])
     tip_color = _hair_socket_value(node, "Tip Color", [0.8, 0.8, 0.8, 1.0])
     return {
+        "contract_version": 3,
         "control_source_material": mat.name,
         "vertex_color": {
             "name": "RFAOS",
             "R": "Random",
             "G": "Factor",
             "B": "Ambient AO",
-            "A": "SystemColor Alpha Mask",
+            "A": "Reserved compatibility channel; SystemColor Alpha is ignored",
+        },
+        "vertex_uv_payload": {
+            "version": 3,
+            "encoding": "HTUE_RGB_TAGGED_UV",
+            "UV1.RG": "SystemColor.RG in linear color space",
+            "UV2.R": "6 + packed UNORM8 Random/Depth",
+            "UV2.G": "Factor",
+            "UV3.R": "6 + Ambient AO",
+            "UV3.G": "SystemColor.B in linear color space",
+            "system_color_source": "evaluated SystemColor.RGB",
+            "system_color_alpha_used": False,
         },
         "vector_parameters": {
             "HT Base Color": base_color,
