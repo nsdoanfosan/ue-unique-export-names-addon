@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -26,6 +27,9 @@ HAIR_TEXTURE_SUFFIXES = {
     "ORM Map": "ORM",
     "Opacity Map": "Opacity",
 }
+HTUE_CONTRACT_PROPERTY = "htue_contract_json"
+HTUE_CONTRACT_SCHEMA = "htue.material.v2"
+HTUE_CONTRACT_VERSION = 2
 TREE_PART_ALIASES = {
     "leaf": "leaf",
     "leaves": "leaf",
@@ -240,7 +244,35 @@ def _hair_socket_value(node, name, fallback):
     return float(value)
 
 
+def _hair_bridge_contract(mat):
+    """Read the optional, persisted sidecar contract without importing the sidecar add-on."""
+    raw_value = mat.get(HTUE_CONTRACT_PROPERTY)
+    if not raw_value:
+        return None
+    try:
+        data = json.loads(str(raw_value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Material '{mat.name}' has invalid {HTUE_CONTRACT_PROPERTY}: {exc}"
+        ) from exc
+    if data.get("schema") != HTUE_CONTRACT_SCHEMA:
+        raise ValueError(
+            f"Material '{mat.name}' has unsupported HTUE schema: {data.get('schema')!r}"
+        )
+    if int(data.get("version", 0)) != HTUE_CONTRACT_VERSION:
+        raise ValueError(
+            f"Material '{mat.name}' has unsupported HTUE version: {data.get('version')!r}"
+        )
+    hair_tool = data.get("hair_tool")
+    if not isinstance(hair_tool, dict):
+        raise ValueError(f"Material '{mat.name}' HTUE contract has no hair_tool payload")
+    return data
+
+
 def _hair_tool_json(mat):
+    bridge_contract = _hair_bridge_contract(mat)
+    if bridge_contract:
+        return bridge_contract["hair_tool"]
     node = _hair_shader_node(mat)
     base_color = _hair_socket_value(node, "Base Color", [0.8, 0.8, 0.8, 1.0])
     root_color = _hair_socket_value(node, "Root Color", [0.0, 0.0, 0.0, 1.0])
@@ -274,6 +306,9 @@ def _hair_tool_json(mat):
 
 
 def _hair_texture_json_entries(mat):
+    bridge_contract = _hair_bridge_contract(mat)
+    if bridge_contract:
+        return list(bridge_contract.get("textures") or [])
     texture_set = HAIR_TEXTURE_SET_BY_MATERIAL.get(clean_token(mat.name).lower())
     if not texture_set:
         return []
@@ -726,6 +761,7 @@ def _speedtree_material_intent(mat, instance_profile=None):
 def _material_json_entry(mat, slot_index, texture_map):
     master_preset = master_preset_for_material(mat)
     is_hair = master_preset == "hair"
+    hair_bridge_contract = _hair_bridge_contract(mat) if is_hair else None
     tree_part = tree_part_for_material(mat) if master_preset == "tree" else None
     tree_shading = (
         tree_shading_for_material(mat, tree_part)
@@ -785,6 +821,15 @@ def _material_json_entry(mat, slot_index, texture_map):
             entry["material_instance_name"] = f"MI_{_material_instance_base_name(mat.name)}"
             entry["create_if_missing"] = True
             entry["hair_tool"] = _hair_tool_json(mat)
+            if hair_bridge_contract:
+                for key in (
+                    "material_instance_path",
+                    "create_if_missing",
+                    "manage_existing_material_instance",
+                    "material_instance_ownership",
+                ):
+                    if key in hair_bridge_contract:
+                        entry[key] = hair_bridge_contract[key]
         material_layer = material_layer_entry_for_material(mat, master_preset)
         if material_layer:
             entry["material_layer"] = material_layer
