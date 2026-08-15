@@ -245,7 +245,18 @@ def _hair_socket_value(node, name, fallback):
 
 
 def _hair_bridge_contract(mat):
-    """Read the optional, persisted sidecar contract without importing the sidecar add-on."""
+    """Refresh the optional sidecar, then read its persisted export contract."""
+    try:
+        from hair_tool_unreal_bridge import contract as htue_contract
+    except ImportError:
+        htue_contract = None
+    if htue_contract is not None and getattr(mat, "htue_settings", None):
+        try:
+            htue_contract.refresh_material_contract(mat)
+        except Exception as exc:
+            raise ValueError(
+                f"Material '{mat.name}' could not refresh its live Hair Tool/HTUE data: {exc}"
+            ) from exc
     raw_value = mat.get(HTUE_CONTRACT_PROPERTY)
     if not raw_value:
         return None
