@@ -13,6 +13,7 @@ from .gpro import (
 from .naming import (
     TEXTURE_PATH_MISSING,
     TEXTURE_PATH_NO_PATH,
+    datablock_library_name,
     image_texture_path_issue,
     top_empty_parent,
 )
@@ -394,10 +395,20 @@ def _json_target_names(objects, combined_only=False, hair_assets=None, context=N
     return names
 
 
-def _validate_clean_name(label, name, errors):
+def _validate_clean_name(label, name, errors, datablock=None):
     clean = clean_token(name)
-    if clean != name:
-        errors.append(f"{label} '{name}' would be written as '{clean}'. Rename it explicitly first.")
+    if clean == name:
+        return
+    library = datablock_library_name(datablock) if datablock is not None else ''
+    if library:
+        # The rename the user is being asked for is impossible in this blend, so
+        # point at the file where it is possible instead.
+        errors.append(
+            f"{label} '{name}' is linked from '{library}' and cannot be renamed "
+            f"here. Rename it to '{clean}' in that library, or make it local."
+        )
+        return
+    errors.append(f"{label} '{name}' would be written as '{clean}'. Rename it explicitly first.")
 
 
 def _json_refresh_validation_errors(context, props, objects, materials, texture_map, hair_assets=None):
@@ -447,11 +458,20 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
 
     for material in materials:
         usage = material_usage_text(material, material_usage)
-        _validate_clean_name("Material", material.name, errors)
+        _validate_clean_name("Material", material.name, errors, material)
         if not clean_token(material.name).startswith(MATERIAL_PREFIX):
-            errors.append(
-                f"Material '{material.name}' must use the {MATERIAL_PREFIX} prefix. Used by: {usage}."
-            )
+            library = datablock_library_name(material)
+            if library:
+                errors.append(
+                    f"Material '{material.name}' is linked from '{library}' and "
+                    f"must use the {MATERIAL_PREFIX} prefix. Rename it to "
+                    f"'{MATERIAL_PREFIX}{clean_token(material.name)}' in that "
+                    f"library, or make it local. Used by: {usage}."
+                )
+            else:
+                errors.append(
+                    f"Material '{material.name}' must use the {MATERIAL_PREFIX} prefix. Used by: {usage}."
+                )
 
         try:
             if master_preset_for_material(material) == "tree":

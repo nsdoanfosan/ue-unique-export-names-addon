@@ -11,11 +11,13 @@ from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_obje
 from .materials import (
     external_data_shared_outside_objects,
     external_materials_from_objects,
+    linked_images_from_materials,
     mutation_safe_mesh_objects,
     protected_painter_data,
 )
 from .naming import (
     cleanup_export_files,
+    datablock_library_name,
     external_workflow_preview_rows,
     export_naming_units,
     image_disk_path,
@@ -154,6 +156,32 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
                 "머티리얼/이미지는 보호됩니다 (no safe external materials).",
             )
             return {"CANCELLED"}
+        # A local material can reference an image linked from a shared texture
+        # library. The Unreal handoff reads those paths, but this workflow
+        # renames images and writes files over them, which a linked datablock
+        # cannot accept. Refuse before touching anything rather than aborting
+        # partway with materials already renamed.
+        linked_images = linked_images_from_materials(materials)
+        if linked_images:
+            labels = [
+                f"{image.name} ({datablock_library_name(image) or 'linked'})"
+                for image in linked_images
+            ]
+            print(
+                "[Unreal Handoff Validator] linked images cannot be renamed or "
+                "rewritten:",
+                labels,
+            )
+            self.report(
+                {"ERROR"},
+                "라이브러리에서 링크된 이미지는 이름을 바꾸거나 파일을 덮어쓸 수 "
+                "없어 아무것도 바꾸지 않고 중단했습니다. 원본 라이브러리에서 "
+                "처리하거나 Make Local 후 다시 실행하세요 "
+                "(linked images are read-only): "
+                + ", ".join(labels[:8]),
+            )
+            return {"CANCELLED"}
+
         texture_map = material_texture_map(materials)
         images = ordered_unique_images(texture_map)
         reset_previous_prepare(materials, images)

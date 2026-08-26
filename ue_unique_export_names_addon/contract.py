@@ -2,7 +2,6 @@ import importlib.util
 import json
 import os
 import sys
-from functools import lru_cache
 from pathlib import Path
 
 
@@ -24,7 +23,26 @@ def _candidate_paths():
             yield path
 
 
-@lru_cache(maxsize=1)
+def _file_stamp(path):
+    """Identity of the file contents, used to detect an updated contract."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+# Caches are keyed by file stamp rather than memoized once. substance-tools owns
+# these files and can be installed, moved or updated while Blender is running,
+# and an add-on reload re-imports this module but leaves sys.modules entries in
+# place. Caching a miss forever, or a stale module, makes this add-on disagree
+# with the other consumers of the same contract - and the descriptor carries a
+# fingerprint, so disagreement surfaces as a mismatch error rather than as
+# something obviously cache-shaped.
+_CONTRACT_CACHE = {}
+_HANDOFF_API_CACHE = {}
+
+
 def pipeline_contract_path():
     for path in _candidate_paths():
         if path.is_file():
@@ -32,15 +50,19 @@ def pipeline_contract_path():
     return None
 
 
-@lru_cache(maxsize=1)
 def pipeline_contract():
     path = pipeline_contract_path()
-    if path is not None:
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+    if path is None:
+        return {}
+    stamp = _file_stamp(path)
+    cached = _CONTRACT_CACHE.get("value")
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    _CONTRACT_CACHE["value"] = (stamp, payload)
+    return payload
 
 
-@lru_cache(maxsize=1)
 def speedtree_handoff_contract():
     """Load the dependency-free SpeedTree handoff API beside the shared JSON.
 
@@ -56,10 +78,12 @@ def speedtree_handoff_contract():
     if not module_path.is_file():
         return None
 
+    stamp = _file_stamp(module_path)
+    cached = _HANDOFF_API_CACHE.get("value")
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
     module_name = "_ue_unique_speedtree_handoff_contract"
-    loaded = sys.modules.get(module_name)
-    if loaded is not None:
-        return loaded
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(
@@ -72,6 +96,7 @@ def speedtree_handoff_contract():
     except Exception:
         sys.modules.pop(module_name, None)
         raise
+    _HANDOFF_API_CACHE["value"] = (stamp, module)
     return module
 
 
