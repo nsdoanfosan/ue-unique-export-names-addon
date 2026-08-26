@@ -537,7 +537,10 @@ def _tree_texture_param_allowed(param, tree_shading):
     normalized = str(param or "").strip().casefold()
     if normalized in TREE_IGNORED_TEXTURE_PARAMS:
         return False
-    return not (tree_shading == "wood" and normalized == "subsurface")
+    return not (
+        tree_shading == "wood"
+        and normalized in {"alpha", "opacity", "opacity map", "subsurface"}
+    )
 
 
 def _tree_texture_role_is_excluded(role, tree_shading):
@@ -696,7 +699,11 @@ def _tree_texture_json_entries(mat, texture_map, tree_shading):
         seen_params.add(param)
         textures.append(_texture_json_entry(role, image, param=param))
 
-    opacity_path = _tree_opacity_path(mat, texture_map)
+    opacity_path = (
+        _tree_opacity_path(mat, texture_map)
+        if _tree_texture_param_allowed("Opacity Map", tree_shading)
+        else None
+    )
     if opacity_path and "Opacity Map" not in seen_params:
         entry = _texture_json_entry_from_path("Opacity Map", opacity_path)
         entry["virtual_texture_streaming"] = False
@@ -731,7 +738,11 @@ def _material_layer_json_entries(
         seen_params.add(param)
         textures.append(_texture_json_entry(role, image, param=param))
     if master_preset == "tree":
-        opacity_path = _tree_opacity_path(mat, texture_map)
+        opacity_path = (
+            _tree_opacity_path(mat, texture_map)
+            if _tree_texture_param_allowed("Opacity Map", tree_shading)
+            else None
+        )
         if opacity_path and "Opacity Map" not in seen_params:
             entry = _texture_json_entry_from_path("Opacity Map", opacity_path)
             entry["virtual_texture_streaming"] = False
