@@ -493,7 +493,8 @@ def material_layer_entry_for_material(mat, master_preset):
 
 
 def _texture_json_entry(role, image, param=None):
-    source_path = bpy.path.abspath(image.filepath_raw or image.filepath).replace("\\", "/")
+    source = image_disk_path(image)
+    source_path = source.as_posix() if source else ""
     entry = {
         "param": param or role,
         "asset_name": texture_asset_name_for_image(image, source_path),
