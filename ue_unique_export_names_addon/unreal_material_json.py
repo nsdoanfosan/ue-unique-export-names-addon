@@ -522,7 +522,7 @@ def _texture_json_entry_from_path(param, source_path):
 
 
 def texture_asset_name_for_image(image, source_path=None):
-    source_path = source_path or bpy.path.abspath(image.filepath_raw or image.filepath)
+    source_path = source_path or image_disk_path(image)
     stem = Path(source_path).stem if source_path else image.name
     clean_name = clean_token(stem)
     if clean_name.startswith(TEXTURE_PREFIX):

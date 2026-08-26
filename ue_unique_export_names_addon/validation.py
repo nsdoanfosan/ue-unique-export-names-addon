@@ -1,7 +1,3 @@
-from pathlib import Path
-
-import bpy
-
 from .armature_repair import armature_validation_warnings
 from .constants import MATERIAL_PREFIX
 from .gpro import (
@@ -11,7 +7,12 @@ from .gpro import (
     unreal_handoff_materials_from_objects,
 )
 from .materials import linked_painter_low_objects, protected_painter_data
-from .naming import material_texture_map, top_empty_parent
+from .naming import (
+    TEXTURE_PATH_NO_PATH,
+    image_texture_path_issue,
+    material_texture_map,
+    top_empty_parent,
+)
 from .transfer import (
     armature_names_for_object,
     export_action_for_object,
@@ -48,11 +49,10 @@ def _hair_asset_validation_row(asset, texture_map):
             errors.append(f"{material.name} has no {MATERIAL_PREFIX} prefix")
         textures = texture_map.get(material, {})
         for role, image in textures.items():
-            source_value = image.filepath_raw or image.filepath
-            if not source_value:
+            issue, _source_path = image_texture_path_issue(image)
+            if issue == TEXTURE_PATH_NO_PATH:
                 errors.append(f"{image.name} ({role}) has no file path")
-                continue
-            if not Path(bpy.path.abspath(source_value)).is_file():
+            elif issue:
                 errors.append(f"{image.name} ({role}) file missing")
 
     transfer_source = ""
@@ -204,11 +204,10 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
             if not textures:
                 continue
             for role, image in textures.items():
-                source_value = image.filepath_raw or image.filepath
-                if not source_value:
+                issue, _source_path = image_texture_path_issue(image)
+                if issue == TEXTURE_PATH_NO_PATH:
                     errors.append(f"{image.name} ({role}) has no file path")
-                    continue
-                if not Path(bpy.path.abspath(source_value)).is_file():
+                elif issue:
                     errors.append(f"{image.name} ({role}) file missing")
 
         status = "ERROR" if errors else "WARN" if warnings else "OK"

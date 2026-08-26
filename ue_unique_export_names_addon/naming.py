@@ -341,10 +341,8 @@ def image_is_writable(image):
     hasn't been exported yet)."""
     if image.has_data:
         return True
-    source_value = image.filepath_raw or image.filepath
-    if not source_value:
-        return False
-    return Path(bpy.path.abspath(source_value)).is_file()
+    source_path = image_disk_path(image)
+    return source_path is not None and source_path.is_file()
 
 
 def image_disk_path(image):
@@ -363,14 +361,42 @@ def image_disk_path(image):
     return Path(source_path).resolve()
 
 
+#: ``image_texture_path_issue`` result for an image with no source path at all.
+TEXTURE_PATH_NO_PATH = "no_path"
+#: ``image_texture_path_issue`` result for a source path that is not a file.
+TEXTURE_PATH_MISSING = "missing"
+
+
+def image_texture_path_issue(image):
+    """Classify an image's Unreal handoff source file.
+
+    Every validator has to agree with the JSON writer about *which* file an
+    image refers to, so the path always comes from :func:`image_disk_path`
+    instead of a local ``bpy.path.abspath`` call. Resolving without the owning
+    library turns a linked material's ``//``-relative path into a path under the
+    asset blend, which reports existing textures as missing.
+
+    :param bpy.types.Image image: The image to inspect.
+    :return tuple: ``(issue, path)``. ``issue`` is ``""`` when the image resolves
+        to a real file, :data:`TEXTURE_PATH_NO_PATH` when it carries no source
+        path, or :data:`TEXTURE_PATH_MISSING` when the resolved path is not a
+        file. ``path`` is the resolved path, or ``None`` when there is none.
+    """
+    source_path = image_disk_path(image)
+    if source_path is None:
+        return TEXTURE_PATH_NO_PATH, None
+    if not source_path.is_file():
+        return TEXTURE_PATH_MISSING, source_path
+    return "", source_path
+
+
 def write_or_copy_image_file(image, new_name, export_dir):
     export_dir.mkdir(parents=True, exist_ok=True)
     target = export_dir / f"{new_name}.png"
     old_filepath = image.filepath
     old_filepath_raw = image.filepath_raw
     old_format = image.file_format
-    source_value = old_filepath_raw or old_filepath
-    source = Path(bpy.path.abspath(source_value)).resolve() if source_value else None
+    source = image_disk_path(image)
     if not image.has_data and source is not None and source.is_file():
         if source != target.resolve():
             shutil.copy2(source, target)
@@ -555,9 +581,10 @@ def write_manifest(context, prefix, objects, materials, texture_map, export_dir)
     for mat in materials:
         textures = {}
         for role, image in texture_map.get(mat, {}).items():
+            source_path = image_disk_path(image)
             textures[role] = {
                 "image_name": image.name,
-                "file_path": bpy.path.abspath(image.filepath_raw or image.filepath),
+                "file_path": str(source_path) if source_path else "",
             }
         manifest["materials"].append(
             {
