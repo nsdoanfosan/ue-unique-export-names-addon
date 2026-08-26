@@ -2,6 +2,7 @@ import bpy
 
 from .constants import BACKUP_PROP, ROLE_BY_BSDF_INPUT
 from .gpro import materials_from_objects
+from .naming import datablock_library_name, is_mutable_datablock
 from .painter_sync import low_export_hierarchy
 from .utils import (
     baking_low_collection,
@@ -117,6 +118,27 @@ def external_materials_from_objects(context, objects, protected=None):
             continue
         materials.append(material)
     return materials, skipped
+
+
+def linked_images_from_materials(materials):
+    """Return images the External workflow cannot rename or rewrite.
+
+    A local material may reference an image linked from a shared texture
+    library. Reading its path is required for the Unreal handoff, but renaming
+    it or writing a new file over it is impossible: linked datablocks are
+    read-only. Report them so the caller can refuse before mutating anything.
+
+    :param list materials: Materials in the External mutation scope.
+    :return list: Linked images, ordered by name.
+    """
+    linked = set()
+    for material in materials:
+        linked.update(
+            image
+            for image in images_from_material(material)
+            if not is_mutable_datablock(image)
+        )
+    return sorted(linked, key=lambda image: image.name.casefold())
 
 
 def external_data_shared_outside_objects(context, materials, objects):

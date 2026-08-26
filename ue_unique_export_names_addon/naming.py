@@ -17,16 +17,49 @@ from .constants import (
 from .gpro import effective_material_names
 from .utils import asset_prefix, clean_token, export_collection, parent_chain
 
+def is_mutable_datablock(datablock):
+    """Whether this add-on may rename the datablock or write properties on it.
+
+    A datablock linked from a library is read-only: assigning ``name`` raises
+    ``AttributeError``. Custom properties and ``filepath`` assignments do *not*
+    raise, they silently write into data the library owns and are lost on
+    reload, so they have to be gated by the same check rather than attempted.
+
+    A library override has ``library is None`` and is writable, so it stays
+    eligible.
+
+    :param datablock: Any Blender ID datablock, or None.
+    :return bool: Whether the datablock is safe to mutate.
+    """
+    return datablock is not None and getattr(datablock, 'library', None) is None
+
+
+def datablock_library_name(datablock):
+    """Return the library filename owning the datablock, or '' when local."""
+    library = getattr(datablock, 'library', None)
+    if library is None:
+        return ''
+    return Path(str(getattr(library, 'filepath', '') or '')).name or str(
+        getattr(library, 'name', '') or ''
+    )
+
+
 def remember_name(datablock):
+    if not is_mutable_datablock(datablock):
+        return False
     if BACKUP_PROP not in datablock:
         datablock[BACKUP_PROP] = datablock.name
+    return True
 
 
 def remember_image_path(image):
+    if not is_mutable_datablock(image):
+        return False
     if BACKUP_FILEPATH_PROP not in image:
         image[BACKUP_FILEPATH_PROP] = image.filepath
     if BACKUP_FILEPATH_RAW_PROP not in image:
         image[BACKUP_FILEPATH_RAW_PROP] = image.filepath_raw
+    return True
 
 
 def unique_name(collection, desired, datablock=None):
@@ -44,6 +77,11 @@ def unique_name(collection, desired, datablock=None):
 
 
 def restore_name(datablock, collection):
+    # A linked datablock can still carry a stale backup property from an older
+    # run, because custom properties are writable on library data even though
+    # the name is not. Renaming it would raise and abort a bulk restore.
+    if not is_mutable_datablock(datablock):
+        return False
     original = datablock.get(BACKUP_PROP)
     if not original:
         return False
@@ -53,6 +91,8 @@ def restore_name(datablock, collection):
 
 
 def restore_image_path(image):
+    if not is_mutable_datablock(image):
+        return False
     restored = False
     if BACKUP_FILEPATH_PROP in image:
         image.filepath = image[BACKUP_FILEPATH_PROP]
