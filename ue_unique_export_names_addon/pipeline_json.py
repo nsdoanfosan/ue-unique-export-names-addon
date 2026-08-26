@@ -1,8 +1,6 @@
 import json
 from pathlib import Path
 
-import bpy
-
 from .constants import MATERIAL_PREFIX
 from .contract import speedtree_handoff_contract
 from .gpro import (
@@ -12,7 +10,12 @@ from .gpro import (
     material_usage_text,
     unreal_handoff_material_slot_entries,
 )
-from .naming import top_empty_parent
+from .naming import (
+    TEXTURE_PATH_MISSING,
+    TEXTURE_PATH_NO_PATH,
+    image_texture_path_issue,
+    top_empty_parent,
+)
 from .transfer import transfer_postprocess_entry
 from .unreal_material_json import (
     _material_json_entry,
@@ -476,15 +479,13 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
             continue
 
         for role, image in textures.items():
-            source_value = image.filepath_raw or image.filepath
-            if not source_value:
+            issue, source_path = image_texture_path_issue(image)
+            if issue == TEXTURE_PATH_NO_PATH:
                 errors.append(
                     f"Texture '{image.name}' ({role}) has no file path. "
                     f"Material: {material.name}. Used by: {usage}."
                 )
-                continue
-            source_path = Path(bpy.path.abspath(source_value))
-            if not source_path.is_file():
+            elif issue == TEXTURE_PATH_MISSING:
                 errors.append(
                     f"Missing texture file: {image.name} ({role}). "
                     f"Material: {material.name}. Used by: {usage}. Path: {source_path}"

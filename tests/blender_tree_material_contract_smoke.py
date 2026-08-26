@@ -259,7 +259,6 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
     assert woody_branch_entry["tree_shading"] == "wood"
     assert _params(woody_branch_entry["textures"]) == {
         "BaseColor",
-        "Opacity Map",
     }
 
     explicit_wood_stem = bpy.data.materials.new("M_stem_explicit_wood_contract")
@@ -272,12 +271,12 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
     assert explicit_wood_entry["tree_shading"] == "wood"
     assert _params(explicit_wood_entry["textures"]) == {
         "BaseColor",
-        "Opacity Map",
     }
 
     for allowed_param in ("Alpha", "Opacity", "Opacity Map"):
         assert not _tree_texture_role_is_excluded(allowed_param, "foliage")
     assert _tree_texture_role_is_excluded("Transmission", "foliage")
+    assert _tree_texture_role_is_excluded("Opacity Map", "wood")
     assert _tree_texture_role_is_excluded("Subsurface", "wood")
     assert not _tree_texture_role_is_excluded("Subsurface", "foliage")
     assert _material_instance_base_name("M_stem_common_01_Mat.001") == (
@@ -402,6 +401,8 @@ with tempfile.TemporaryDirectory() as temp_dir_value:
                 assert "Subsurface" in top_params
                 assert "Subsurface" in layer_params
             else:
+                assert "Opacity Map" not in top_params
+                assert "Opacity Map" not in layer_params
                 assert "Subsurface" not in top_params
                 assert "Subsurface" not in layer_params
         actual_path = _write_pipeline_sidecar(

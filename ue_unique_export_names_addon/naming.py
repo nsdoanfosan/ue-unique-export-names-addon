@@ -112,7 +112,10 @@ def find_image_node_from_socket(socket, visited=None):
         if node in visited:
             continue
         visited.add(node)
-        if node.type == "TEX_IMAGE" and node.image and not node.image.library:
+        # Linked material libraries are read-only, but their image datablocks
+        # still carry the source paths that the Unreal handoff needs.  Reading
+        # those paths must not require making the material local.
+        if node.type == "TEX_IMAGE" and node.image:
             return node
         for input_socket in getattr(node, "inputs", []):
             found = find_image_node_from_socket(input_socket, visited)
@@ -157,7 +160,7 @@ def find_canonical_handoff_image_for_role(mat, role):
     if not mat or not mat.node_tree:
         return None
     for node in mat.node_tree.nodes:
-        if node.type != "TEX_IMAGE" or not node.image or node.image.library:
+        if node.type != "TEX_IMAGE" or not node.image:
             continue
         if image_matches_handoff_role(node.image, role):
             return node.image
@@ -169,7 +172,7 @@ def ensure_required_handoff_roles(mat, textures):
         if textures.get(role):
             continue
         image = find_canonical_handoff_image_for_role(mat, role)
-        if image is not None and not image.library and not image_is_excluded_handoff_texture(image):
+        if image is not None and not image_is_excluded_handoff_texture(image):
             textures[role] = image
 
 
@@ -253,7 +256,6 @@ def material_texture_map(materials):
             if (
                 node.type == "TEX_IMAGE"
                 and node.image
-                and not node.image.library
                 and not image_is_excluded_handoff_texture(node.image)
                 and (
                     image_node_has_output_links(node)
@@ -339,17 +341,53 @@ def image_is_writable(image):
     hasn't been exported yet)."""
     if image.has_data:
         return True
-    source_value = image.filepath_raw or image.filepath
-    if not source_value:
-        return False
-    return Path(bpy.path.abspath(source_value)).is_file()
+    source_path = image_disk_path(image)
+    return source_path is not None and source_path.is_file()
 
 
 def image_disk_path(image):
     source_value = image.filepath_raw or image.filepath
     if not source_value:
         return None
-    return Path(bpy.path.abspath(source_value)).resolve()
+    # ``//`` inside a linked image is relative to its owning library, not the
+    # current asset blend.  Passing the library preserves that distinction and
+    # lets a linked material produce a usable Unreal source path unchanged.
+    try:
+        source_path = bpy.path.abspath(source_value, library=image.library)
+    except TypeError:
+        # Blender versions without the ``library`` keyword retain the legacy
+        # behavior rather than failing a handoff outright.
+        source_path = bpy.path.abspath(source_value)
+    return Path(source_path).resolve()
+
+
+#: ``image_texture_path_issue`` result for an image with no source path at all.
+TEXTURE_PATH_NO_PATH = "no_path"
+#: ``image_texture_path_issue`` result for a source path that is not a file.
+TEXTURE_PATH_MISSING = "missing"
+
+
+def image_texture_path_issue(image):
+    """Classify an image's Unreal handoff source file.
+
+    Every validator has to agree with the JSON writer about *which* file an
+    image refers to, so the path always comes from :func:`image_disk_path`
+    instead of a local ``bpy.path.abspath`` call. Resolving without the owning
+    library turns a linked material's ``//``-relative path into a path under the
+    asset blend, which reports existing textures as missing.
+
+    :param bpy.types.Image image: The image to inspect.
+    :return tuple: ``(issue, path)``. ``issue`` is ``""`` when the image resolves
+        to a real file, :data:`TEXTURE_PATH_NO_PATH` when it carries no source
+        path, or :data:`TEXTURE_PATH_MISSING` when the resolved path is not a
+        file. ``path`` is the resolved path, or ``None`` when there is none.
+    """
+    source_path = image_disk_path(image)
+    if source_path is None:
+        return TEXTURE_PATH_NO_PATH, None
+    if not source_path.is_file():
+        return TEXTURE_PATH_MISSING, source_path
+    return "", source_path
 
 
 def write_or_copy_image_file(image, new_name, export_dir):
@@ -358,8 +396,7 @@ def write_or_copy_image_file(image, new_name, export_dir):
     old_filepath = image.filepath
     old_filepath_raw = image.filepath_raw
     old_format = image.file_format
-    source_value = old_filepath_raw or old_filepath
-    source = Path(bpy.path.abspath(source_value)).resolve() if source_value else None
+    source = image_disk_path(image)
     if not image.has_data and source is not None and source.is_file():
         if source != target.resolve():
             shutil.copy2(source, target)
@@ -544,9 +581,10 @@ def write_manifest(context, prefix, objects, materials, texture_map, export_dir)
     for mat in materials:
         textures = {}
         for role, image in texture_map.get(mat, {}).items():
+            source_path = image_disk_path(image)
             textures[role] = {
                 "image_name": image.name,
-                "file_path": bpy.path.abspath(image.filepath_raw or image.filepath),
+                "file_path": str(source_path) if source_path else "",
             }
         manifest["materials"].append(
             {
