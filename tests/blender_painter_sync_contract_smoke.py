@@ -129,7 +129,7 @@ assert not external_manual.get(AUTO_PAINTER_EXPORT_LINK_PROP)
 for auto_linked in {low_mesh, mesh_parent, character_root, rig, rig_root}:
     assert auto_linked.get(AUTO_PAINTER_EXPORT_LINK_PROP)
 
-# Blender 5.1 must report the ID types the filter relies on.
+# Blender 5.2 must report the ID types the filter relies on.
 transform_updates = _capture_updates(
     lambda: setattr(low_mesh.location, "x", low_mesh.location.x + 1.0)
 )

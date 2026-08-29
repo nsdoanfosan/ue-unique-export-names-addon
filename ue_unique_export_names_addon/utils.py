@@ -109,6 +109,61 @@ def is_hair_tool_object(obj):
     )
 
 
+def geometry_nodes_input_value(modifier, identifier, fallback=None):
+    """Read one Geometry Nodes input across Blender API generations."""
+    try:
+        input_group = modifier.properties.inputs[identifier]
+        return input_group["value"] if "value" in input_group else fallback
+    except (AttributeError, KeyError, TypeError):
+        inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+        interface = getattr(getattr(modifier, "node_group", None), "interface", None)
+        if inputs is not None and interface is not None and identifier == "Input_3":
+            for item in interface.items_tree:
+                if (
+                    getattr(item, "item_type", None) == "SOCKET"
+                    and getattr(item, "in_out", None) == "INPUT"
+                    and item.name in {"Source Surface", "Strands Material"}
+                ):
+                    try:
+                        input_group = inputs[item.identifier]
+                        return (
+                            input_group["value"]
+                            if "value" in input_group
+                            else fallback
+                        )
+                    except (KeyError, TypeError):
+                        break
+        try:
+            return modifier.get(identifier, fallback)
+        except (AttributeError, TypeError):
+            return fallback
+
+
+def geometry_nodes_input_values(modifier):
+    """Yield exposed Geometry Nodes values without modifier IDProperties."""
+    inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+    interface = getattr(getattr(modifier, "node_group", None), "interface", None)
+    if inputs is not None and interface is not None:
+        for item in interface.items_tree:
+            if (
+                getattr(item, "item_type", None) != "SOCKET"
+                or getattr(item, "in_out", None) != "INPUT"
+            ):
+                continue
+            try:
+                input_group = inputs[item.identifier]
+                if "value" in input_group:
+                    yield input_group["value"]
+            except (KeyError, TypeError):
+                continue
+        return
+    try:
+        for identifier in modifier.keys():
+            yield modifier.get(identifier)
+    except (AttributeError, TypeError):
+        return
+
+
 def hair_tool_input_object(obj):
     for modifier in obj.modifiers:
         if (
@@ -117,10 +172,7 @@ def hair_tool_input_object(obj):
             or not modifier.node_group.name.startswith("Hair_System_Setup")
         ):
             continue
-        try:
-            input_object = modifier.get("Input_3")
-        except (KeyError, TypeError):
-            input_object = None
+        input_object = geometry_nodes_input_value(modifier, "Input_3")
         if isinstance(input_object, bpy.types.Object):
             return input_object
     return None
@@ -137,8 +189,7 @@ def hair_tool_profile_materials(obj):
             or not node_group.name.startswith("Hair_System_Profile")
         ):
             continue
-        for key in modifier.keys():
-            value = modifier.get(key)
+        for value in geometry_nodes_input_values(modifier):
             if not isinstance(value, bpy.types.Material):
                 continue
             if value.name in seen:

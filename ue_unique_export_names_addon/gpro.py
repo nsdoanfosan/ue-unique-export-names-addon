@@ -1,6 +1,10 @@
 import bpy
 
-from .utils import clean_token
+from .utils import (
+    clean_token,
+    geometry_nodes_input_value,
+    geometry_nodes_input_values,
+)
 
 def is_gpro_instance_modifier(modifier):
     modifier_name = clean_token(getattr(modifier, "name", "")).casefold()
@@ -16,12 +20,11 @@ def gpro_instance_collections(obj):
         if not is_gpro_instance_modifier(modifier):
             continue
         for key in ("Socket_2",):
-            value = modifier.get(key)
+            value = geometry_nodes_input_value(modifier, key)
             if isinstance(value, bpy.types.Collection) and value.name not in seen:
                 collections.append(value)
                 seen.add(value.name)
-        for key in modifier.keys():
-            value = modifier.get(key)
+        for value in geometry_nodes_input_values(modifier):
             if isinstance(value, bpy.types.Collection) and value.name not in seen:
                 collections.append(value)
                 seen.add(value.name)
