@@ -2,7 +2,6 @@ from .armature_repair import armature_validation_warnings
 from .constants import MATERIAL_PREFIX
 from .gpro import (
     effective_material_slot_entries,
-    has_gpro_instance_material_source,
     unreal_handoff_material_slot_entries,
     unreal_handoff_materials_from_objects,
 )
@@ -185,7 +184,7 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
             errors.append("No material slots")
         elif not handoff_materials and not is_hair_tool_object(obj):
             warnings.append("No UE handoff material")
-        if empty_slot_count and not painter_low and not has_gpro_instance_material_source(obj):
+        if empty_slot_count and not painter_low:
             errors.append(f"{empty_slot_count} empty material slot")
 
         if clean_token(obj.name) != obj.name:

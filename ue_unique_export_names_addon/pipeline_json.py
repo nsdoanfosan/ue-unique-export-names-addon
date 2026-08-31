@@ -254,7 +254,10 @@ def write_unreal_pipeline_json(
                 ):
                     continue
                 seen_materials.add(mat)
-                entries.append(_material_json_entry(mat, slot_index, texture_map))
+                entry = _material_json_entry(mat, slot_index, texture_map)
+                if has_gpro_instance_material_source(obj):
+                    entry["slot_match_required"] = True
+                entries.append(entry)
             json_paths.append(
                 _write_pipeline_sidecar(
                     json_dir,
@@ -286,7 +289,10 @@ def write_unreal_pipeline_json(
                 ):
                     continue
                 seen_materials.add(mat)
-                entries.append(_material_json_entry(mat, slot_index, texture_map))
+                entry = _material_json_entry(mat, slot_index, texture_map)
+                if has_gpro_instance_material_source(obj):
+                    entry["slot_match_required"] = True
+                entries.append(entry)
                 slot_index += 1
         if entries:
             child_validation = [
@@ -453,7 +459,7 @@ def _json_refresh_validation_errors(context, props, objects, materials, texture_
         if not handoff_slots:
             continue
         for slot_index, mat, _location in effective_slots:
-            if mat is None and not has_gpro_instance_material_source(obj):
+            if mat is None:
                 errors.append(f"Mesh '{obj.name}' slot {slot_index} has no material.")
 
     for material in materials:
