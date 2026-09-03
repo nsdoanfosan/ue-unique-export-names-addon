@@ -22,7 +22,7 @@ The two add-ons have separate responsibilities:
 | High/Low setup | `substance-tools` fork | Creates and manages `Baking/low` and `Baking/high` |
 | Painter project and baking | `substance-tools` + Painter startup plugin | Exports temporary FBX files, creates or updates the SPP, and controls mesh-map baking |
 | Painter texture return | `substance-tools` | Exports with `Unreal_V2`, reloads the maps, and connects them to Low materials |
-| Unreal handoff | Unreal Handoff Validator | Automatically mirrors Low meshes and their parent chains into `Export` and protects Painter-managed data |
+| Unreal handoff | Unreal Handoff Validator | Prepares the safe Low export unit, mirrors its hierarchy into `Export`, and protects Painter-managed data |
 | Unreal mesh export | Send to Unreal | Exports the objects linked into `Export` |
 
 Normal order:
@@ -36,19 +36,25 @@ Normal order:
    the shared `texture` folder, and connect the maps to Low materials.
 6. Do not rename Low materials after the Painter round trip. Painter Texture Set
    names come from Blender material names with the leading `M_` removed.
-7. Unreal Handoff Validator automatically links the Low meshes and their complete
-   existing parent chains into `Export`. There is no Painter handoff button.
-8. Export with Send to Unreal. Enable **Combine > Child meshes** when an Empty
-   and its children should become one Unreal asset.
+7. The optional retopo/Painter adoption path calls
+   `ensure_painter_low_export_unit(low, asset_base)`. A standalone static
+   `<base>_low` becomes the child of an exact top-level Empty `<base>` while the
+   child name and world transform remain unchanged. Rigged and shape-keyed
+   hierarchies are preserved instead; an incompatible non-skeletal parent stops
+   without mutation.
+8. Continue only after the retopo/Painter pipeline reaches `VERIFIED`. For the managed
+   static unit, use Send to Unreal **Combine > Child meshes** and keep UE Unique
+   `use_immediate_parent_name` off; Unreal then receives `<base>`, not
+   `<base>_low`.
 
 For Painter Low assets, do **not** run **Prepare External Asset**. The automatic
 link marks the Low objects, mesh data, materials, images, and texture files as
 protected, so the External workflow skips them.
 
-The integration uses shared Blender structure and naming; neither add-on imports
-the other. `substance-tools` owns Painter creation, baking, texture export, and
-texture reconnection. Unreal Handoff Validator owns automatic `Export` collection
-synchronization and the protection boundary.
+The integration uses a public versioned API rather than copied operators.
+`substance-tools` owns Painter creation, baking, texture export, and texture
+reconnection. Unreal Handoff Validator owns Low export-unit naming, automatic
+`Export` collection synchronization, and the protection boundary.
 
 ## Installation
 
@@ -63,15 +69,17 @@ Blender 3.6 or newer is required.
 
 The add-on watches `Baking/low` continuously.
 
-- Every mesh inside `Baking/low` is linked directly into `Export`.
+- Every mesh inside `Baking/low` is linked into `Export` with the hierarchy that
+  currently owns it.
 - Each mesh's complete existing parent chain is also linked, including
   Armatures and parents above an Armature.
 - A sibling mesh under the same Armature is not linked unless that sibling is
   also inside `Baking/low`.
 - Adding, removing, or reparenting a Low mesh updates the links automatically.
 - `Export` is created automatically when the first Low mesh appears.
-- Names, mesh data, materials, textures, parenting, and transforms are not
-  changed.
+- The background watcher does not change names, data, parenting, or transforms.
+  The explicit `ensure_painter_low_export_unit` API may add the managed Empty
+  described below, but never changes the Low world transform.
 - Only collection links managed by this automatic workflow are removed.
   Unrelated External objects already in `Export` are preserved.
 
@@ -86,6 +94,30 @@ Character_Root
 
 The Low mesh, Armature, and `Character_Root` are linked into `Export`.
 `Preview_Mesh` is not.
+
+For one safe standalone static retopology result, the public API prepares this
+different unit:
+
+```text
+Prop_Stone_01              <- top-level Empty; Unreal asset name
+`-- Prop_Stone_01_low      <- mesh in Baking/low; Painter pairing name
+```
+
+The generated Empty is linked at the scene root and mirrored into `Export`; it
+is not classified as a `Baking/low` object. Only the `_low` mesh belongs there.
+
+- Automatic wrapping is limited to a static mesh with no parent, Armature
+  semantics, or shape keys.
+- The exact Empty must be top-level and contain no unrelated mesh.
+- An exact-name/type/ownership collision fails. The API never accepts Blender's
+  `.001` fallback.
+- The child keeps its exact `_low` name and world matrix.
+- Send2UE Combine is set to `Child meshes` and
+  `use_immediate_parent_name` is disabled when those options are available.
+- A rig or shape-keyed hierarchy is linked as-is and is never reparented merely
+  to alter the Unreal name. An existing parent Empty is accepted only when it is
+  the exact top-level `<base>` and contains no other mesh; any other
+  non-skeletal parent is a no-mutation error.
 
 Meshes present in both `Baking/low` and `Export` are protected Painter assets.
 Objects sharing their mesh data, materials, or images are also protected from
@@ -195,6 +227,10 @@ Important code areas:
   `painter_export_hierarchy`;
 - automatic synchronization: `sync_painter_export`,
   `sync_painter_export_on_depsgraph`, `sync_painter_export_on_load`;
+- public standalone export-unit preparation:
+  `api.get_painter_low_export_api(2)` service
+  `unreal-handoff.painter-low-export`, then
+  `ensure_painter_low_export_unit`;
 - Painter-data protection: `linked_painter_low_objects`,
   `protected_painter_data`;
 - External all-in-one operator: `UEUN_OT_prepare_external_asset`;

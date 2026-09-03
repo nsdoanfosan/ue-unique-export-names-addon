@@ -7,6 +7,10 @@ import bpy
 from .gpro import is_unreal_handoff_material, unreal_handoff_materials_from_objects
 from .naming import material_texture_map, resolve_export_dir, top_empty_parent
 from .pipeline_json import _json_refresh_validation_errors, write_unreal_pipeline_json
+from .painter_sync import (
+    ensure_painter_low_export_unit as _ensure_painter_low_export_unit,
+    sync_painter_export,
+)
 from .utils import (
     asset_prefix,
     clean_token,
@@ -22,7 +26,31 @@ __all__ = (
     "resolve_export_directory",
     "resolve_asset_unit_name",
     "resolve_sidecar_json_path",
+    "ensure_painter_low_export_unit",
+    "get_painter_low_export_api",
+    "sync_painter_low_export",
+    "PAINTER_LOW_EXPORT_API_VERSION",
+    "PAINTER_LOW_EXPORT_SERVICE_ID",
 )
+
+
+PAINTER_LOW_EXPORT_API_VERSION = 2
+PAINTER_LOW_EXPORT_SERVICE_ID = "unreal-handoff.painter-low-export"
+
+
+def get_painter_low_export_api(version=PAINTER_LOW_EXPORT_API_VERSION):
+    """Return the exact supported Low-to-Unreal handoff service."""
+    if version != PAINTER_LOW_EXPORT_API_VERSION:
+        raise ValueError(
+            f"Painter Low export API {version!r} is incompatible with "
+            f"{PAINTER_LOW_EXPORT_API_VERSION}"
+        )
+    return {
+        "service_id": PAINTER_LOW_EXPORT_SERVICE_ID,
+        "version": PAINTER_LOW_EXPORT_API_VERSION,
+        "ensure_painter_low_export_unit": ensure_painter_low_export_unit,
+        "sync_painter_low_export": sync_painter_low_export,
+    }
 
 
 def _context(context=None):
@@ -143,3 +171,42 @@ def resolve_sidecar_json_path(candidates, context=None):
         if path.exists():
             return str(path)
     return None
+
+
+def sync_painter_low_export(scene=None):
+    """Synchronize ``Baking/low`` into Send2UE's ``Export`` collection.
+
+    This is the public cross-add-on entry point.  Producers should place Low
+    objects in ``Baking/low`` and call this function instead of duplicating
+    Export collection membership rules.
+    """
+    receipt = dict(sync_painter_export(scene))
+    receipt["service_id"] = PAINTER_LOW_EXPORT_SERVICE_ID
+    receipt["api_version"] = PAINTER_LOW_EXPORT_API_VERSION
+    receipt["operation"] = "sync_painter_low_export"
+    receipt["status"] = "SUCCESS"
+    receipt["synced"] = True
+    return receipt
+
+
+def ensure_painter_low_export_unit(low_object, asset_base, scene=None):
+    """Prepare one standalone static Low for Empty-based Send2UE naming.
+
+    ``low_object`` keeps its ``_low`` suffix for Painter matching.  A safe
+    static standalone mesh is parented under an exact ``asset_base`` Empty,
+    then the whole hierarchy is synchronized into ``Export``. Existing rigged
+    or parented hierarchies are preserved and described in the receipt.
+    """
+    receipt = dict(
+        _ensure_painter_low_export_unit(low_object, asset_base, scene=scene)
+    )
+    receipt["service_id"] = PAINTER_LOW_EXPORT_SERVICE_ID
+    receipt["api_version"] = PAINTER_LOW_EXPORT_API_VERSION
+    receipt["operation"] = "ensure_painter_low_export_unit"
+    if receipt.get("handoff_ready"):
+        receipt["status"] = "SUCCESS"
+    elif receipt.get("unit_status") == "PRESERVED_SKELETAL_HIERARCHY":
+        receipt["status"] = "PRESERVED_SKELETAL_HIERARCHY"
+    else:
+        receipt["status"] = "PENDING_SEND2UE"
+    return receipt

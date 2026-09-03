@@ -1,0 +1,23 @@
+name: Public API contract
+
+on:
+  pull_request:
+    paths:
+      - "ue_unique_export_names_addon/**"
+      - "tests/**"
+      - "README.md"
+      - ".github/workflows/api-contract.yml"
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  api-contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m compileall -q ue_unique_export_names_addon
+      - run: python -m unittest discover -s tests -p "test_*.py" -v

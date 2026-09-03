@@ -13,7 +13,7 @@ from ue_unique_export_names_addon.constants import (
     EXPORT_COLLECTION_NAME,
 )
 import ue_unique_export_names_addon as addon
-from ue_unique_export_names_addon import painter_sync
+from ue_unique_export_names_addon import api, painter_sync
 
 
 class _FakeUpdate:
@@ -111,7 +111,7 @@ scene.collection.children.link(export)
 export.objects.link(manual_low)
 export.objects.link(external_manual)
 
-initial = painter_sync.sync_painter_export(scene)
+initial = api.sync_painter_low_export(scene)
 expected_initial = {
     low_mesh,
     mesh_parent,
@@ -122,7 +122,16 @@ expected_initial = {
     external_manual,
 }
 _assert_direct_members(export, expected_initial)
-assert initial == {"linked": 5, "unlinked": 0, "desired": 6}
+assert initial == {
+    "linked": 5,
+    "unlinked": 0,
+    "desired": 6,
+    "service_id": "unreal-handoff.painter-low-export",
+    "api_version": 2,
+    "operation": "sync_painter_low_export",
+    "status": "SUCCESS",
+    "synced": True,
+}
 assert not _is_direct_member(export, sibling)
 assert not manual_low.get(AUTO_PAINTER_EXPORT_LINK_PROP)
 assert not external_manual.get(AUTO_PAINTER_EXPORT_LINK_PROP)

@@ -38,9 +38,29 @@ def ensure_export_collection(context):
     return coll
 
 
-def baking_low_collection():
+def _collection_belongs_to_scene(collection, scene):
+    if collection is None or scene is None:
+        return collection is not None
+    pending = list(scene.collection.children)
+    while pending:
+        candidate = pending.pop()
+        if candidate is collection:
+            return True
+        pending.extend(candidate.children)
+    return False
+
+
+def baking_low_collection(scene=None):
+    """Return the exact Baking/low collection owned by ``scene``.
+
+    Collection names are global Blender datablock names. Verifying the Baking
+    root against the requested scene prevents a public API call from mutating
+    a similarly prepared collection that belongs to another scene.
+    """
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
     baking = bpy.data.collections.get(BAKING_ROOT_COLLECTION_NAME)
-    if baking is not None:
+    if baking is not None and _collection_belongs_to_scene(baking, scene):
         for child in baking.children:
             if child.name == BAKING_LOW_COLLECTION_NAME:
                 return child
