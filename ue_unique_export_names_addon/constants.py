@@ -4,9 +4,10 @@ from .contract import collection_name, naming_value, pipeline_contract
 BACKUP_PROP = "_ue_unique_export_original_name"
 BACKUP_FILEPATH_PROP = "_ue_unique_export_original_filepath"
 BACKUP_FILEPATH_RAW_PROP = "_ue_unique_export_original_filepath_raw"
-# Legacy marker from versions that created Painter grouping Empties. Restore
-# still recognizes it so old .blend files can clean those generated objects up.
+# Marks an Empty created by the Painter Low export-unit API.  Restore also
+# recognizes the same marker on legacy grouping Empties.
 CREATED_EMPTY_PROP = "_ue_unique_export_created_empty"
+PAINTER_EXPORT_ASSET_PROP = "_ue_unique_export_asset_name_v1"
 AUTO_PAINTER_EXPORT_LINK_PROP = "_ue_unique_export_auto_link"
 
 # Send to Unreal exports the objects inside a collection named "Export"; the addon's

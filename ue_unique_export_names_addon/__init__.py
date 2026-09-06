@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Unreal Handoff Validator",
     "author": "Codex",
-    "version": (2, 8, 2),
+    "version": (2, 8, 3),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Unreal Handoff",
     "description": "Validate Blender-to-Unreal handoff data and write the Unreal postprocess manifest.",

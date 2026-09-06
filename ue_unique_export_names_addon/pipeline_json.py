@@ -17,6 +17,7 @@ from .naming import (
     image_texture_path_issue,
     top_empty_parent,
 )
+from .nested_pivots import get_asset_pivot
 from .transfer import transfer_postprocess_entry
 from .unreal_material_json import (
     _material_json_entry,
@@ -37,6 +38,8 @@ def _asset_unit_groups(context, objects):
     asset name even when an Armature (or another in-scope object) sits between
     that Empty and the mesh.  Direct-parent-only grouping therefore produces a
     sidecar for the child mesh name instead of the imported asset name.
+    A connected pair of explicit static Export pivots opts into separate
+    ownership, matching the nested-pivot boundary in Send to Unreal.
     """
     objects = list(objects)
     export_coll = export_collection(context)
@@ -57,7 +60,7 @@ def _asset_unit_groups(context, objects):
     groups_by_root = {}
     roots_in_order = []
     for obj in objects:
-        root = top_empty_parent(obj, scope_objects)
+        root = get_asset_pivot(obj, export_coll) or top_empty_parent(obj, scope_objects)
         if root is None:
             standalone.append(obj)
             continue
@@ -270,8 +273,8 @@ def write_unreal_pipeline_json(
             )
             written_target_names.add(mesh_name)
 
-    # 2) Per Empty asset-unit sidecar. Send to Unreal names/combines the unit by
-    # its highest Empty, so aggregate all descendant mesh materials in order.
+    # 2) Per Empty asset-unit sidecar. Explicit nested static export pivots own
+    # separate units; other hierarchies retain their highest-Empty grouping.
     standalone_names = {clean_token(obj.name) for obj in standalone_objects}
     for empty, unit_objects in asset_unit_groups:
         empty_name = clean_token(empty.name)

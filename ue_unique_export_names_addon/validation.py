@@ -12,6 +12,7 @@ from .naming import (
     material_texture_map,
     top_empty_parent,
 )
+from .nested_pivots import get_asset_pivot
 from .transfer import (
     armature_names_for_object,
     export_action_for_object,
@@ -173,7 +174,7 @@ def export_validation_rows(context, props=None, objects=None, materials=None, te
         parent_names = [parent.name for parent in parent_chain(obj)]
         armatures = armature_names_for_object(obj)
         texture_roles = texture_roles_for_materials(handoff_materials, texture_map)
-        unit_root = top_empty_parent(obj, export_objects) or obj
+        unit_root = get_asset_pivot(obj, export_coll) or top_empty_parent(obj, export_objects) or obj
         painter_low = obj in painter_low_objects
         errors = []
         warnings = []

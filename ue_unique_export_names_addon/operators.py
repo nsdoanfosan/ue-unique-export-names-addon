@@ -22,6 +22,8 @@ from .naming import (
     export_naming_units,
     image_disk_path,
     image_is_writable,
+    is_packed_image_backup,
+    packed_image_preflight_issue,
     image_material_role_lookup,
     image_suffix,
     material_texture_map,
@@ -30,7 +32,6 @@ from .naming import (
     ordered_unique_images,
     remember_image_path,
     remember_name,
-    reset_previous_prepare,
     resolve_export_dir,
     restore_image_path,
     restore_name,
@@ -184,10 +185,11 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
 
         texture_map = material_texture_map(materials)
         images = ordered_unique_images(texture_map)
-        reset_previous_prepare(materials, images)
-
-        texture_map = material_texture_map(materials)
-        images = ordered_unique_images(texture_map)
+        # Keep the prepared datablock names and external paths on repeat runs.
+        # Their backup properties are owned by the explicit Restore operator.
+        # Restoring them here made a second Send2UE attempt point externalized
+        # Meshy images back at their original empty paths after packed bytes had
+        # correctly been removed.
         image_context = image_material_role_lookup(texture_map)
         export_dir = resolve_export_dir(props.texture_export_dir)
         protected_paths = {
@@ -196,11 +198,29 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
             for path in [image_disk_path(image)]
             if path is not None
         }
+        # A previously prepared external asset can already point at the exact
+        # PNGs in the shared texture folder. Preserve those live source files
+        # during prefix cleanup so repeated Handoff/Send2UE runs remain
+        # idempotent instead of deleting the files immediately before copying
+        # or saving them again.
+        current_source_paths = {
+            path
+            for image in images
+            for path in [image_disk_path(image)]
+            if path is not None and path.is_file()
+        }
 
         # Pre-flight: when writing files, confirm every image CAN be written before
         # renaming anything. Otherwise an empty image (no pixels, no file on disk)
         # aborts mid-run and leaves materials/images half-renamed.
         if props.texture_handling == "WRITE_FILES":
+            packed_issues = [
+                f"{image.name}: {issue}" for image in images
+                if (issue := packed_image_preflight_issue(image))
+            ]
+            if packed_issues:
+                self.report({"ERROR"}, "; ".join(packed_issues))
+                return {"CANCELLED"}
             blockers = []
             for image in images:
                 if image_is_writable(image):
@@ -248,7 +268,7 @@ class UEUN_OT_prepare_names(bpy.types.Operator):
             cleanup_export_files(
                 export_dir,
                 prefix,
-                preserve_paths=protected_paths,
+                preserve_paths=protected_paths | current_source_paths,
             )
 
         for index, mat in enumerate(materials):
@@ -521,10 +541,14 @@ class UEUN_OT_restore_names(bpy.types.Operator):
                 continue
             if restore_name(mat, bpy.data.materials):
                 restored += 1
-        for image in bpy.data.images:
+        for image in [image for image in bpy.data.images if not is_packed_image_backup(image)]:
             if image in protected["images"]:
                 continue
-            path_restored = restore_image_path(image)
+            try:
+                path_restored = restore_image_path(image)
+            except RuntimeError as error:
+                self.report({"ERROR"}, f"이미지 '{image.name}' 복원 실패: {error}")
+                return {"CANCELLED"}
             name_restored = restore_name(image, bpy.data.images)
             if path_restored or name_restored:
                 restored += 1

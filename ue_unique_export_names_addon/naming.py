@@ -1,5 +1,8 @@
 import json
+import hashlib
+from array import array
 import shutil
+import tempfile
 from pathlib import Path
 
 import bpy
@@ -16,6 +19,145 @@ from .constants import (
 )
 from .gpro import effective_material_names
 from .utils import asset_prefix, clean_token, export_collection, parent_chain
+
+
+PACKED_RESTORE_BACKUP_PROP = "ue_unique_packed_restore_backup"
+PACKED_BACKUP_OWNED_PROP = "ue_unique_packed_backup_owned"
+PACKED_EDITED_BACKUP_PROP = "ue_unique_packed_edited_backup"
+PACKED_ORIGINAL_RECOVERY_PROP = "ue_unique_packed_original_recovery"
+PACKED_LATEST_BACKUP_PROP = "ue_unique_packed_latest_backup"
+PACKED_PREPARED_PIXELS_PROP = "ue_unique_packed_prepared_pixels"
+
+
+def is_packed_image_backup(image):
+    return bool(image.get(PACKED_BACKUP_OWNED_PROP))
+
+
+def packed_image_preflight_issue(image):
+    if image.packed_file is not None and len(image.packed_files) != 1:
+        return "Multiple packed files (tiles or views) must be externalized separately"
+    return ""
+
+
+def _copy_image_pixels(source, target):
+    pixels = array('f', [0.0]) * len(source.pixels)
+    source.pixels.foreach_get(pixels)
+    target.pixels.foreach_set(pixels)
+    target.update()
+
+
+def _image_pixel_digest(image):
+    pixels = array('f', [0.0]) * len(image.pixels)
+    image.pixels.foreach_get(pixels)
+    return hashlib.sha256(pixels.tobytes()).hexdigest()
+
+
+def _new_packed_backup(image):
+    backup = image.copy()
+    backup.name = f".UEUN packed backup {image.name}"
+    for key in (
+        BACKUP_PROP, BACKUP_FILEPATH_PROP, BACKUP_FILEPATH_RAW_PROP,
+        PACKED_RESTORE_BACKUP_PROP, PACKED_EDITED_BACKUP_PROP,
+        PACKED_ORIGINAL_RECOVERY_PROP,
+        PACKED_LATEST_BACKUP_PROP, PACKED_PREPARED_PIXELS_PROP,
+    ):
+        if key in backup:
+            del backup[key]
+    backup[PACKED_BACKUP_OWNED_PROP] = True
+    backup.use_fake_user = True
+    return backup
+
+
+def _remove_packed_snapshot(backup):
+    for key in (PACKED_EDITED_BACKUP_PROP, PACKED_LATEST_BACKUP_PROP):
+        child = backup.get(key)
+        if isinstance(child, bpy.types.Image) and is_packed_image_backup(child):
+            del backup[key]
+            bpy.data.images.remove(child)
+    bpy.data.images.remove(backup)
+
+
+def _snapshot_image_pixels(image):
+    snapshot = _new_packed_backup(image)
+    try:
+        if image.is_float:
+            # Blender packs float buffers to EXR. Its STRAIGHT decoder would
+            # premultiply these already-authored RGB values again on reload.
+            snapshot.alpha_mode = 'CHANNEL_PACKED'
+        _copy_image_pixels(image, snapshot)
+        snapshot.pack()
+        return snapshot
+    except Exception:
+        bpy.data.images.remove(snapshot)
+        raise
+
+
+def _snapshot_packed_source(image):
+    backup = _new_packed_backup(image)
+    try:
+        if image.is_dirty:
+            backup[PACKED_EDITED_BACKUP_PROP] = _snapshot_image_pixels(image)
+        return backup
+    except Exception:
+        _remove_packed_snapshot(backup)
+        raise
+
+
+def _discard_packed_backup(image, backup, *, retain_original=False):
+    if PACKED_RESTORE_BACKUP_PROP in image:
+        del image[PACKED_RESTORE_BACKUP_PROP]
+    for key in (PACKED_EDITED_BACKUP_PROP, PACKED_LATEST_BACKUP_PROP):
+        edited = backup.get(key)
+        if isinstance(edited, bpy.types.Image) and is_packed_image_backup(edited):
+            del backup[key]
+            bpy.data.images.remove(edited)
+    if retain_original:
+        # For dirty inputs Restore adopts the latest pixels as a durable
+        # packed source. Keep the pre-edit payload separately for recovery.
+        previous = image.get(PACKED_ORIGINAL_RECOVERY_PROP)
+        if previous is None:
+            image[PACKED_ORIGINAL_RECOVERY_PROP] = backup
+            backup.name = f".UEUN original packed recovery {image.name}"
+            return
+    bpy.data.images.remove(backup)
+
+
+def _ensure_packed_backup(image):
+    """Persist the original bytes in the blend, independently of the PNG export.
+
+    Image.copy does not copy unsaved pixels. Keep those in a second packed copy
+    when present; this allows both rollback to the live dirty buffer and a
+    durable Restore of the artist's latest pixels instead of stale packed data.
+    """
+    backup = image.get(PACKED_RESTORE_BACKUP_PROP)
+    if backup is not None:
+        if not isinstance(backup, bpy.types.Image) or not is_packed_image_backup(backup):
+            raise RuntimeError(f"Invalid packed-image backup for '{image.name}'")
+        return backup, False
+    backup = _snapshot_packed_source(image)
+    image[PACKED_RESTORE_BACKUP_PROP] = backup
+    return backup, True
+
+
+def _pack_image_bytes(image, data):
+    image.pack(data=data, data_len=len(data))
+
+
+def _restore_packed_source(image, backup, filepath, filepath_raw, file_format, *, dirty=False):
+    edited = backup.get(PACKED_EDITED_BACKUP_PROP)
+    packed_source = backup if dirty or edited is None else edited
+    data = bytes(packed_source.packed_file.data)
+    # Assigning Image.filepath while packed repacks the current pixel buffer
+    # in Blender, replacing the supplied payload. Set paths first inside the
+    # caller's rollback transaction, then install the exact packed bytes last.
+    image.filepath = filepath
+    image.filepath_raw = filepath_raw
+    image.alpha_mode = packed_source.alpha_mode
+    _pack_image_bytes(image, data)
+    image.reload()
+    image.file_format = file_format
+    if dirty and edited is not None:
+        _copy_image_pixels(edited, image)
 
 def is_mutable_datablock(datablock):
     """Whether this add-on may rename the datablock or write properties on it.
@@ -93,6 +235,49 @@ def restore_name(datablock, collection):
 def restore_image_path(image):
     if not is_mutable_datablock(image):
         return False
+    if PACKED_RESTORE_BACKUP_PROP in image:
+        backup = image.get(PACKED_RESTORE_BACKUP_PROP)
+        if not isinstance(backup, bpy.types.Image) or not is_packed_image_backup(backup):
+            raise RuntimeError(f"Packed-image backup is missing for '{image.name}'; keeping its current source")
+        # Do not replace a usable external source with the old empty filepath
+        # until the original packed source has been restored successfully.
+        current = (image.filepath, image.filepath_raw, image.file_format, image.alpha_mode)
+        current_packed = bytes(image.packed_file.data) if image.packed_file else None
+        prepared_digest = backup.get(PACKED_PREPARED_PIXELS_PROP)
+        has_new_pixels = image.is_dirty or (
+            prepared_digest is not None and _image_pixel_digest(image) != prepared_digest
+        )
+        current_pixels = _snapshot_image_pixels(image) if has_new_pixels else None
+        restore_source = current_pixels or backup.get(PACKED_LATEST_BACKUP_PROP) or backup
+        retain_original = restore_source is not backup or backup.get(PACKED_EDITED_BACKUP_PROP) is not None
+        try:
+            _restore_packed_source(
+                image, restore_source,
+                image.get(BACKUP_FILEPATH_PROP, backup.filepath),
+                image.get(BACKUP_FILEPATH_RAW_PROP, backup.filepath_raw),
+                backup.file_format,
+            )
+        except Exception:
+            if image.packed_file is not None:
+                image.unpack(method="REMOVE")
+            image.filepath, image.filepath_raw, image.file_format, image.alpha_mode = current
+            if current_packed is not None:
+                _pack_image_bytes(image, current_packed)
+            image.reload()
+            if current_pixels is not None:
+                _copy_image_pixels(current_pixels, image)
+            raise
+        finally:
+            if current_pixels is not None:
+                bpy.data.images.remove(current_pixels)
+        for key in (BACKUP_FILEPATH_PROP, BACKUP_FILEPATH_RAW_PROP):
+            if key in image:
+                del image[key]
+        _discard_packed_backup(
+            image, backup,
+            retain_original=retain_original,
+        )
+        return True
     restored = False
     if BACKUP_FILEPATH_PROP in image:
         image.filepath = image[BACKUP_FILEPATH_PROP]
@@ -379,7 +564,7 @@ def image_is_writable(image):
     the External Textures workflow doesn't rename half the datablocks and then abort
     on an empty image (e.g. an unrendered bake target, or a Painter texture that
     hasn't been exported yet)."""
-    if image.has_data:
+    if image.has_data or image.packed_file is not None:
         return True
     source_path = image_disk_path(image)
     return source_path is not None and source_path.is_file()
@@ -430,13 +615,135 @@ def image_texture_path_issue(image):
     return "", source_path
 
 
-def write_or_copy_image_file(image, new_name, export_dir):
+def _packed_image_suffix(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".bin"
+
+
+def _write_packed_image_as_png(image, target, source_snapshot=None):
+    """Externalize one packed image as a real PNG for Unreal handoff.
+
+    Meshy Bridge imports GLB textures as packed JPEG datablocks whose Blender
+    ``has_data`` flag can remain false until pixels are explicitly accessed.
+    Writing the packed bytes directly to a ``.png`` path would leave a JPEG
+    payload behind a misleading extension, so non-PNG payloads are decoded by
+    Blender and re-encoded as PNG first.
+    """
+    packed = image.packed_file
+    if packed is None and source_snapshot is None:
+        raise RuntimeError(f"Image '{image.name}' is not packed")
+
+    issue = packed_image_preflight_issue(image)
+    if issue:
+        raise RuntimeError(f"Image '{image.name}': {issue}")
+    # The immutable first-Prepare backup is for Restore only. Exports always
+    # consume this call's current source, including new edits and repacking.
+    transient = None
+    if source_snapshot is not None:
+        current = source_snapshot.get(PACKED_EDITED_BACKUP_PROP) or source_snapshot
+        packed = current.packed_file
+    elif image.is_dirty:
+        transient = _snapshot_image_pixels(image)
+        packed = transient.packed_file
+
+    try:
+        data = bytes(packed.data)
+    finally:
+        if transient is not None:
+            bpy.data.images.remove(transient)
+    if not data:
+        raise RuntimeError(f"Packed image '{image.name}' contains no bytes")
+
+    suffix = _packed_image_suffix(data)
+    if suffix == ".png":
+        target.write_bytes(data)
+    else:
+        temp_path = None
+        converted = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(data)
+                temp_path = Path(handle.name)
+            converted = bpy.data.images.load(str(temp_path), check_existing=False)
+            # Blender lazily decodes file-backed images in background sessions.
+            # Touching one pixel makes ``Image.save`` operate on real pixels.
+            _ = converted.pixels[0]
+            converted.filepath_raw = str(target)
+            converted.file_format = "PNG"
+            converted.save()
+        finally:
+            if converted is not None:
+                bpy.data.images.remove(converted)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    # Keep the Blender material pointed at the same external file used by the
+    # sidecar. Removing the packed copy prevents a later save from silently
+    # preferring stale embedded bytes over the prepared PNG.
+    if image.packed_file is not None:
+        image.unpack(method="REMOVE")
+    image.filepath = str(target)
+    image.filepath_raw = str(target)
+    image.file_format = "PNG"
+    try:
+        image.reload()
+    except RuntimeError:
+        # The filepath remains authoritative; reload may be lazy in background
+        # Blender, while the verified target file is already usable.
+        pass
+
+
+def _write_or_copy_image_file(image, new_name, export_dir):
+    issue = packed_image_preflight_issue(image)
+    if issue:
+        raise RuntimeError(f"Image '{image.name}': {issue}")
     export_dir.mkdir(parents=True, exist_ok=True)
     target = export_dir / f"{new_name}.png"
     old_filepath = image.filepath
     old_filepath_raw = image.filepath_raw
     old_format = image.file_format
     source = image_disk_path(image)
+    if image.packed_file is not None:
+        was_dirty = image.is_dirty
+        backup, created = _ensure_packed_backup(image)
+        current_source = backup if created else _snapshot_packed_source(image)
+        try:
+            _write_packed_image_as_png(image, target, current_source)
+        except Exception:
+            _restore_packed_source(
+                image, current_source, old_filepath, old_filepath_raw, old_format,
+                dirty=was_dirty,
+            )
+            if created:
+                _discard_packed_backup(image, backup)
+            raise
+        finally:
+            if not created:
+                _remove_packed_snapshot(current_source)
+        return target
+    if image.is_dirty:
+        # Changing even an unchanged filepath can reload a file-backed Image.
+        # Export a snapshot before touching those setters so painted pixels
+        # survive both repeated Prepare and a failed write.
+        current_pixels = _snapshot_image_pixels(image)
+        try:
+            _write_packed_image_as_png(image, target, current_pixels)
+        except Exception:
+            image.filepath = old_filepath
+            image.filepath_raw = old_filepath_raw
+            image.file_format = old_format
+            _copy_image_pixels(current_pixels, image)
+            raise
+        finally:
+            bpy.data.images.remove(current_pixels)
+        return target
     if not image.has_data and source is not None and source.is_file():
         if source != target.resolve():
             shutil.copy2(source, target)
@@ -462,6 +769,33 @@ def write_or_copy_image_file(image, new_name, export_dir):
             return target
         raise
     image.file_format = "PNG"
+    return target
+
+
+def write_or_copy_image_file(image, new_name, export_dir):
+    """Write current pixels, retaining independent original/edited Restore data."""
+    backup = image.get(PACKED_RESTORE_BACKUP_PROP)
+    latest = None
+    if backup is not None:
+        prepared_digest = backup.get(PACKED_PREPARED_PIXELS_PROP)
+        if image.is_dirty or (
+            prepared_digest is not None and _image_pixel_digest(image) != prepared_digest
+        ):
+            latest = _snapshot_image_pixels(image)
+    try:
+        target = _write_or_copy_image_file(image, new_name, export_dir)
+    except Exception:
+        if latest is not None:
+            bpy.data.images.remove(latest)
+        raise
+    backup = image.get(PACKED_RESTORE_BACKUP_PROP)
+    if backup is not None:
+        if latest is not None:
+            previous = backup.get(PACKED_LATEST_BACKUP_PROP)
+            backup[PACKED_LATEST_BACKUP_PROP] = latest
+            if previous is not None:
+                bpy.data.images.remove(previous)
+        backup[PACKED_PREPARED_PIXELS_PROP] = _image_pixel_digest(image)
     return target
 
 
