@@ -13,7 +13,7 @@ from ue_unique_export_names_addon.constants import (
     EXPORT_COLLECTION_NAME,
 )
 import ue_unique_export_names_addon as addon
-from ue_unique_export_names_addon import painter_sync
+from ue_unique_export_names_addon import api, painter_sync
 
 
 class _FakeUpdate:
@@ -111,7 +111,7 @@ scene.collection.children.link(export)
 export.objects.link(manual_low)
 export.objects.link(external_manual)
 
-initial = painter_sync.sync_painter_export(scene)
+initial = api.sync_painter_low_export(scene)
 expected_initial = {
     low_mesh,
     mesh_parent,
@@ -122,7 +122,16 @@ expected_initial = {
     external_manual,
 }
 _assert_direct_members(export, expected_initial)
-assert initial == {"linked": 5, "unlinked": 0, "desired": 6}
+assert initial == {
+    "linked": 5,
+    "unlinked": 0,
+    "desired": 6,
+    "service_id": "unreal-handoff.painter-low-export",
+    "api_version": 2,
+    "operation": "sync_painter_low_export",
+    "status": "SUCCESS",
+    "synced": True,
+}
 assert not _is_direct_member(export, sibling)
 assert not manual_low.get(AUTO_PAINTER_EXPORT_LINK_PROP)
 assert not external_manual.get(AUTO_PAINTER_EXPORT_LINK_PROP)
@@ -367,5 +376,39 @@ addon.register()
 assert not painter_sync._painter_export_sync_state_ready
 assert bpy.app.timers.is_registered(painter_sync.sync_painter_export_deferred)
 addon.unregister()
+
+# Deleting or unlinking the Low collection invalidates automatic links in its
+# owning scene. Missing Low in another scene must never clean this scene.
+painter_sync.sync_painter_export(scene)
+owner_pointer = scene.as_pointer()
+other_scene = bpy.data.scenes.new("Contract_OtherScene")
+before_members = set(export.objects)
+snapshot = painter_sync._capture_export_sync_transaction(low)
+assert painter_sync.sync_painter_export(other_scene) == {"linked": 0, "unlinked": 0, "desired": 0}
+assert set(export.objects) == before_members
+assert painter_sync._painter_export_scene_pointer == owner_pointer
+painter_sync._clear_painter_export_sync_state()
+assert painter_sync._painter_export_scene_pointer == 0
+painter_sync._restore_export_sync_transaction(snapshot)
+assert painter_sync._painter_export_scene_pointer == owner_pointer
+
+baking.children.unlink(low)
+assert painter_sync.sync_painter_export(other_scene) == {"linked": 0, "unlinked": 0, "desired": 0}
+assert set(export.objects) == before_members
+unlinked_low = painter_sync.sync_painter_export(scene)
+assert unlinked_low == {"linked": 0, "unlinked": 5, "desired": 0}
+_assert_direct_members(export, {manual_low, external_manual})
+baking.children.link(low)
+assert painter_sync.sync_painter_export(scene) == {"linked": 5, "unlinked": 0, "desired": 5}
+bpy.data.collections.remove(low, do_unlink=True)
+assert painter_sync._depsgraph_requires_painter_export_sync(_FakeDepsgraph(scene), scene)
+assert painter_sync.sync_painter_export(other_scene) == {"linked": 0, "unlinked": 0, "desired": 0}
+deleted_low = painter_sync.sync_painter_export(scene)
+assert deleted_low == {"linked": 0, "unlinked": 5, "desired": 0}
+_assert_direct_members(export, {manual_low, external_manual})
+for obj in before_members - {manual_low, external_manual}:
+    assert not obj.get(AUTO_PAINTER_EXPORT_LINK_PROP)
+painter_sync.reset_painter_export_sync_state()
+assert painter_sync._painter_export_scene_pointer == 0
 
 print("painter export sync contract smoke: OK")
