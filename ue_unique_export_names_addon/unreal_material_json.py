@@ -1,5 +1,6 @@
 import json
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import bpy
@@ -567,14 +568,15 @@ def _tree_layer_param_for_role(role):
 def _subsurface_sibling_path(source_path):
     source_path = Path(source_path)
     stem_lower = source_path.stem.casefold()
-    base_stem = None
+    # SpeedTree exports Color as M_<material>.png (without a color suffix)
+    # and its paired SSS as M_<material>_SubsurfaceColor.png. This helper is
+    # only called for a confirmed Albedo role: keep the full stem unless an
+    # authored color suffix needs removing, and require an exact sibling.
+    base_stem = source_path.stem
     for suffix in TREE_BASE_COLOR_SUFFIXES:
         if stem_lower.endswith(suffix):
             base_stem = source_path.stem[:-len(suffix)]
             break
-    if not base_stem:
-        return None
-
     extensions = [source_path.suffix, ".tga", ".png", ".tif", ".tiff", ".exr"]
     seen_extensions = set()
     for source_suffix in TREE_SUBSURFACE_SOURCE_SUFFIXES:
@@ -588,6 +590,51 @@ def _subsurface_sibling_path(source_path):
                 return candidate.resolve()
         seen_extensions.clear()
     return None
+
+
+def _speedtree_declared_subsurface_path(mat, albedo_paths):
+    """Read an authored SSS binding only when its Color matches this material.
+
+    SpeedTree's exported File and original Source can have different layouts.
+    Keep the SSS in the same path domain as the actual Albedo, including when
+    the artist explicitly uses one image for both Color and SubsurfaceColor.
+    """
+    source_fbx = str(mat.get("codex_source_fbx", "")).strip()
+    if not source_fbx:
+        return None
+    stmat = Path(source_fbx).with_suffix(".stmat")
+    try:
+        root = ET.parse(stmat).getroot()
+    except (OSError, ET.ParseError):
+        return None
+
+    def identity(path):
+        return str(Path(path).resolve()).casefold()
+
+    def map_path(value):
+        path = Path(value)
+        return path if path.is_absolute() else stmat.parent / path
+
+    def material_key(value):
+        return re.sub(r"_mat$", "", str(value), flags=re.IGNORECASE).casefold()
+
+    albedos = {identity(path) for path in albedo_paths}
+    candidates = {}
+    for material in root.findall("Material"):
+        if material_key(material.get("Name")) != material_key(mat.name):
+            continue
+        maps = {node.get("Name", "").casefold(): node for node in material.findall("Map")}
+        color, sss = maps.get("color"), maps.get("subsurfacecolor")
+        if color is None or sss is None:
+            continue
+        for domain in ("File", "Source"):
+            color_value, sss_value = color.get(domain), sss.get(domain)
+            if not color_value or not sss_value:
+                continue
+            candidate = map_path(sss_value)
+            if identity(map_path(color_value)) in albedos and candidate.is_file():
+                candidates[identity(candidate)] = candidate.resolve()
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
 
 
 def _tree_subsurface_path(mat, texture_map, tree_shading):
@@ -609,10 +656,14 @@ def _tree_subsurface_path(mat, texture_map, tree_shading):
             continue
         target = preferred if str(role).casefold() in {"basecolor", "albedo"} else fallback
         target.append(image)
-    for image in preferred + fallback:
-        source_path = image_disk_path(image)
-        if not source_path:
-            continue
+    albedo_paths = [
+        path for image in preferred + fallback
+        if (path := image_disk_path(image)) is not None
+    ]
+    declared_path = _speedtree_declared_subsurface_path(mat, albedo_paths)
+    if declared_path:
+        return declared_path
+    for source_path in albedo_paths:
         sibling_path = _subsurface_sibling_path(source_path)
         if sibling_path:
             return sibling_path
