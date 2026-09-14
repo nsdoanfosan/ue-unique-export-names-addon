@@ -251,3 +251,12 @@ Keep the automatic-link ownership marker and protected-Painter-data checks when
 changing the workflow. They prevent stale Low links from accumulating while
 ensuring that shared Painter materials, images, mesh datablocks, and disk
 textures are not renamed or overwritten indirectly.
+# Scoped Painter baking collections
+
+Painter Low discovery honors Substance Tools' per-scene `st_baking_root_name` and
+the child's `substance_tools_role`. This keeps assets in separate scenes of the
+same original blend isolated even when Blender suffixes a child name (`low.001`).
+The root must belong to the requested scene; legacy `Baking/low` stays supported.
+
+Validate with Blender `--factory-startup --background --python
+tests/blender_scoped_baking_low_smoke.py` (no preference writes).
