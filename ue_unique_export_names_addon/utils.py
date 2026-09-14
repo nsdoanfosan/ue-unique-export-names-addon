@@ -59,10 +59,12 @@ def baking_low_collection(scene=None):
     """
     if scene is None:
         scene = getattr(bpy.context, "scene", None)
-    baking = bpy.data.collections.get(BAKING_ROOT_COLLECTION_NAME)
+    root_name = (scene.get('st_baking_root_name') if scene is not None else None)
+    baking = bpy.data.collections.get(root_name or BAKING_ROOT_COLLECTION_NAME)
     if baking is not None and _collection_belongs_to_scene(baking, scene):
         for child in baking.children:
-            if child.name == BAKING_LOW_COLLECTION_NAME:
+            if (child.get('substance_tools_role') == BAKING_LOW_COLLECTION_NAME
+                    or child.name == BAKING_LOW_COLLECTION_NAME):
                 return child
     return None
 
