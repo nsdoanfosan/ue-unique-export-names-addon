@@ -7,7 +7,7 @@ from .constants import (
     EXPORT_COLLECTION_NAME,
     PAINTER_EXPORT_ASSET_PROP,
 )
-from .utils import baking_low_collection, clean_token
+from .utils import baking_low_collection, clean_token, geometry_nodes_input_values
 
 _painter_export_sync_running = False
 _painter_export_sync_state_ready = False
@@ -107,6 +107,7 @@ def _current_collection_membership_signature(scene=None):
         tuple(sorted(_id_pointer(obj) for obj in export_coll.objects))
         if export_coll is not None
         else (),
+        tuple(sorted(_id_pointer(obj) for obj in _non_export_bake_objects(low_collection))),
     )
 
 
@@ -134,6 +135,7 @@ def _capture_painter_export_sync_state(low_collection, low_objects, desired, exp
         tuple(sorted(_id_pointer(obj) for obj in export_coll.objects))
         if export_coll is not None
         else (),
+        tuple(sorted(_id_pointer(obj) for obj in _non_export_bake_objects(low_collection))),
     )
     _painter_export_sync_state_ready = True
     _painter_export_scene_pointer = _id_pointer(scene)
@@ -209,9 +211,42 @@ def _painter_export_hierarchy_from_objects(low_objects):
     return hierarchy
 
 
+def _non_export_bake_objects(low_collection):
+    """High/alpha/collision and their instanced authoring data are bake-only.
+
+    A GroupPro container can appear in a low object's parent chain. Parenting
+    does not turn a high into an Unreal export object. Follow collection inputs
+    as well as ordinary collection instances, including unlinked GPro sources.
+    """
+    if low_collection is None:
+        return set()
+    roots = [c for c in bpy.data.collections if low_collection in tuple(c.children)]
+    pending = [child for root in roots for child in root.children
+               if (child.get('substance_tools_role') or child.name) in {'high', 'alpha', 'collision'}]
+    visited = set()
+    blocked = set()
+    while pending:
+        coll = pending.pop()
+        pointer = _id_pointer(coll)
+        if pointer in visited:
+            continue
+        visited.add(pointer)
+        pending.extend(coll.children)
+        for obj in coll.objects:
+            blocked.add(obj)
+            if obj.instance_collection is not None:
+                pending.append(obj.instance_collection)
+            for mod in obj.modifiers:
+                if mod.type == 'NODES' and mod.node_group:
+                    pending.extend(value for value in geometry_nodes_input_values(mod)
+                                   if isinstance(value, bpy.types.Collection))
+    return blocked
+
+
 def painter_export_hierarchy(low_collection):
     """Low meshes, their parents, and rigs referenced by Armature modifiers."""
-    return _painter_export_hierarchy_from_objects(set(low_collection.all_objects))
+    return (_painter_export_hierarchy_from_objects(set(low_collection.all_objects))
+            - _non_export_bake_objects(low_collection))
 
 
 def _is_static_standalone_low(obj):
@@ -641,6 +676,7 @@ def sync_painter_export(scene=None):
         )
         desired = (
             _painter_export_hierarchy_from_objects(low_objects)
+            - _non_export_bake_objects(low_collection)
             if low_collection is not None
             else set()
         )
