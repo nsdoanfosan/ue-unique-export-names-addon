@@ -373,6 +373,7 @@ def image_matches_handoff_role(image, role):
         "Normal": ("_normal",),
         "Emissive": ("_emissive",),
         "Height": ("_height",),
+        "Opacity": ("_opacity",),
         "SheenColor": ("_sheencolor",),
         "SheenOpacity": ("_sheenopacity",),
         "SheenRoughness": ("_sheenroughness",),
@@ -393,7 +394,7 @@ def find_canonical_handoff_image_for_role(mat, role):
 
 
 def ensure_required_handoff_roles(mat, textures):
-    for role in ("Height",):
+    for role in ("Height", "Opacity"):
         if textures.get(role):
             continue
         image = find_canonical_handoff_image_for_role(mat, role)
@@ -411,6 +412,8 @@ def fallback_role_from_node(node):
         return "SheenOpacity"
     if "sheen" in text and "rough" in text:
         return "SheenRoughness"
+    if image_matches_handoff_role(image, "Opacity"):
+        return "Opacity"
     if "base" in text or "albedo" in text or "diffuse" in text or "color" in text:
         return "BaseColor"
     if "extra" in text:
@@ -454,6 +457,7 @@ def image_node_is_canonical_handoff_texture(node):
         "_sheencolor",
         "_sheenopacity",
         "_sheenroughness",
+        "_opacity",
     ))
 
 

@@ -369,6 +369,11 @@ def _strip_first_prefix(value, prefixes):
 
 
 DEFAULT_MATERIAL_LAYER_PRESETS = {
+    "fabric_twosided": {
+        "parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_FabricTwoSided",
+        "folder": "/Game/Material/AssetSurface/MYI/FabricTwoSided",
+        "strip_prefixes": (),
+    },
     "layer": {
         "parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
         "folder": "/Game/Material/AssetSurface/MYI/LayerBlend",
@@ -415,6 +420,11 @@ def _texture_param_map(overrides=None, extras=None):
 
 
 def _texture_param_map_for_material_layer_preset(key):
+    if key == "fabric_twosided":
+        front = _texture_param_map(MATERIAL_LAYER_TEXTURE_PARAM_OVERRIDES.get("cloth"), CLOTH_TEXTURE_PARAM_EXTRAS)
+        supported = {k: v for k, v in front.items() if k in {"Albedo", "Extra", "Normal", "Sheen Color", "Sheen Opacity", "Sheen Roughness"}}
+        supported["Opacity Map"] = "Opacity Map"
+        return dict(supported, **{"Backface " + k: "Backface " + v for k, v in supported.items()})
     if key == "cloth":
         return _texture_param_map(
             MATERIAL_LAYER_TEXTURE_PARAM_OVERRIDES.get("cloth"),
@@ -503,7 +513,7 @@ def _texture_json_entry(role, image, param=None):
     }
     if param and param != role:
         entry["source_param"] = role
-    if (param or role) == "Opacity Map":
+    if (param or role) in {"Opacity Map", "Backface Opacity Map"}:
         entry["virtual_texture_streaming"] = False
     return entry
 
@@ -815,6 +825,8 @@ def _material_layer_json_entries(
 
 def master_preset_for_material(mat):
     name = clean_token(mat.name).lower()
+    if re.search(r"(?:^|_)fabrictwosided(?:_|$)", name):
+        return "fabric_twosided"
     if tree_part_for_material(mat):
         return "tree"
     if is_hair_material_name(mat.name):
@@ -891,6 +903,28 @@ def _material_json_entry(mat, slot_index, texture_map):
     }
     if master_preset:
         entry["master_preset"] = master_preset
+        if master_preset == "fabric_twosided":
+            entry["two_sided"] = True
+            explicit = str(mat.get("unreal_backface_material", "") or "").strip()
+            paired_name = explicit or (mat.name + "_back" if not mat.name.endswith("_back") else "")
+            back = bpy.data.materials.get(paired_name) if paired_name else mat
+            if explicit and back is None:
+                raise ValueError(f"Missing backface material '{explicit}' for '{mat.name}'")
+            back = back or mat
+            source = texture_map.get(back, {})
+            remap = _texture_param_map_for_material_layer_preset("fabric_twosided")
+            front_keys = {k for k in remap if not k.startswith("Backface ")}
+            back_textures = []
+            seen = set()
+            for role, image in source.items():
+                layer_param = surface_layer_param_for_role(role)
+                if layer_param in front_keys and layer_param not in seen:
+                    seen.add(layer_param)
+                    back_textures.append(_texture_json_entry(role, image, param="Backface " + layer_param))
+            if not entry["layers"] or not back_textures:
+                raise ValueError(f"FabricTwoSided texture handoff is empty for '{mat.name}'")
+            entry["layers"][0]["textures"].extend(back_textures)
+            entry["backface_material"] = back.name
         if master_preset == "tree":
             entry["tree_part"] = tree_part
             entry["tree_shading"] = tree_shading
