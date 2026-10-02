@@ -403,8 +403,18 @@ class UEUN_OT_reimport_unreal_textures(bpy.types.Operator):
         "texture assets in Unreal"
     )
     bl_options = {"REGISTER"}
+    workstation_phase_id: StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})
 
     def execute(self, context):
+        operation = None
+        coordination = None
+        if self.workstation_phase_id:
+            try:
+                from send2ue import coordination
+                coordination.load_bridge().require_active_phase(self.workstation_phase_id, coordination.RESOURCE)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Unreal work phase is unavailable: {exc}")
+                return {"CANCELLED"}
         refresh_result = bpy.ops.ue_unique_names.refresh_unreal_json()
         if "FINISHED" not in refresh_result:
             return {"CANCELLED"}
@@ -434,8 +444,43 @@ class UEUN_OT_reimport_unreal_textures(bpy.types.Operator):
             f'_p.reimport_textures_from_json(r"{json_arg}")',
         ]
         try:
-            run_commands(commands)
+            if coordination is not None:
+                operation = coordination.begin_operation(
+                    self.workstation_phase_id, bpy.app.driver_namespace,
+                    str(json_path.resolve()), pipeline="send2ue-texture-reimport",
+                )
+                # Source-matching textures can live outside the sidecar's mesh
+                # folder; this native utility does not expose a complete scope list.
+                operation.require_scopes(["editor"])
+            if operation is not None:
+                # The utility logs unresolved entries and returns a successful
+                # count. A coordinated receipt must account for every requested
+                # native entry rather than acknowledging a partial import.
+                commands[-1:] = [
+                    "import json as _wq_texture_json",
+                    f'with open(r"{json_arg}", encoding="utf-8") as _wq_handle:',
+                    "\t_wq_data = _wq_texture_json.load(_wq_handle)",
+                    "_wq_expected = set()",
+                    "for _wq_entry in _wq_data.get('materials', []):",
+                    "\tfor _wq_layer in _p._entry_layers(_wq_entry, _p._master_preset(_wq_data, _wq_entry)):",
+                    "\t\tfor _wq_texture in _wq_layer.get('textures', []):",
+                    "\t\t\t_wq_expected.add((_wq_texture.get('asset_name'), _wq_texture.get('param')))",
+                    "if not _wq_expected:",
+                    "\traise RuntimeError('Texture reimport has no native texture entries')",
+                    f'_wq_imported = _p.reimport_textures_from_json(r"{json_arg}")',
+                    "if _wq_imported != len(_wq_expected):",
+                    "\traise RuntimeError('Texture reimport did not complete every requested native texture entry')",
+                ]
+            if operation is not None:
+                operation.check()
+                run_commands(commands, strict=True)
+            else:
+                run_commands(commands)
+            if operation is not None:
+                operation.complete()
         except Exception as exc:
+            if operation is not None:
+                operation.fail(exc)
             self.report({"ERROR"}, f"Unreal texture reimport failed: {exc}")
             return {"CANCELLED"}
 
