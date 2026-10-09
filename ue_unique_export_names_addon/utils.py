@@ -1,4 +1,5 @@
 import re
+import sys
 from pathlib import Path
 
 import bpy
@@ -97,6 +98,19 @@ def json_scope_mesh_objects(context, scope):
     return [obj for obj in objects if obj.type == "MESH"]
 
 
+def _send2ue_export_source_allowed(obj):
+    """Share an active native send's source domain without importing Send2UE.
+
+    Painter can relink its Low meshes during dependency-graph updates. Export
+    collection membership alone therefore does not identify the FBX's sources.
+    The native predicate also admits generated Hair Tool meshes and returns
+    True when no explicit selection is active, preserving ordinary Handoff.
+    """
+    selection = sys.modules.get("send2ue.core.export_selection")
+    includes = getattr(selection, "includes", None)
+    return bool(includes(obj)) if callable(includes) else True
+
+
 def scope_objects_for_validation(context, scope):
     if scope == "SELECTED":
         return [obj for obj in context.selected_objects if obj.visible_get()]
@@ -104,7 +118,8 @@ def scope_objects_for_validation(context, scope):
         coll = export_collection(context)
         if not coll:
             return []
-        return [obj for obj in coll.all_objects if obj.visible_get()]
+        return [obj for obj in coll.all_objects
+                if obj.visible_get() and _send2ue_export_source_allowed(obj)]
     return [obj for obj in context.scene.objects if obj.visible_get()]
 
 
