@@ -369,6 +369,11 @@ def _strip_first_prefix(value, prefixes):
 
 
 DEFAULT_MATERIAL_LAYER_PRESETS = {
+    "gemstone": {
+        "parent": "/Game/Materials/Gemstone/Layers/ML_Gemstone_Crystal",
+        "folder": "/Game/Materials/Gemstone/MYI",
+        "strip_prefixes": (),
+    },
     "fabric_twosided": {
         "parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_FabricTwoSided",
         "folder": "/Game/Material/AssetSurface/MYI/FabricTwoSided",
@@ -420,6 +425,10 @@ def _texture_param_map(overrides=None, extras=None):
 
 
 def _texture_param_map_for_material_layer_preset(key):
+    if key == "gemstone":
+        # Crystal inputs and appearance are authored in Unreal, independently
+        # of the source's Painter maps.
+        return {}
     if key == "fabric_twosided":
         front = _texture_param_map(MATERIAL_LAYER_TEXTURE_PARAM_OVERRIDES.get("cloth"), CLOTH_TEXTURE_PARAM_EXTRAS)
         supported = {k: v for k, v in front.items() if k in {"Albedo", "Extra", "Normal", "Sheen Color", "Sheen Opacity", "Sheen Roughness"}}
@@ -458,6 +467,11 @@ def _material_layer_presets():
     }
     for key, preset in presets.items():
         preset["texture_remap"] = _texture_param_map_for_material_layer_preset(key)
+    gemstone_layer = pipeline_contract().get("unreal_handoff_sidecar", {}).get("gemstone_material_layer", {})
+    if gemstone_layer.get("parent"):
+        presets["gemstone"]["parent"] = gemstone_layer["parent"]
+    if gemstone_layer.get("instance_folder"):
+        presets["gemstone"]["folder"] = gemstone_layer["instance_folder"]
     cloth_layer = _contract_cloth_material_layer()
     if isinstance(cloth_layer, dict) and cloth_layer:
         cloth = presets.setdefault("cloth", {})
@@ -825,6 +839,8 @@ def _material_layer_json_entries(
 
 def master_preset_for_material(mat):
     name = clean_token(mat.name).lower()
+    if re.search(r"(?:^|_)gemstone(?:_|$)", name):
+        return "gemstone"
     if re.search(r"(?:^|_)fabrictwosided(?:_|$)", name):
         return "fabric_twosided"
     if tree_part_for_material(mat):
@@ -858,6 +874,16 @@ def _speedtree_material_intent(mat, instance_profile=None):
 
 def _material_json_entry(mat, slot_index, texture_map):
     master_preset = master_preset_for_material(mat)
+    if master_preset == "gemstone":
+        return {
+            "name": mat.name, "slot_name": mat.name, "slot_index": slot_index,
+            "master_preset": "gemstone", "translucent": False,
+            "create_if_missing": True,
+            "manage_existing_material_instance": False,
+            "material_instance_ownership": "artist",
+            "textures": [], "layers": [],
+            "material_layer": material_layer_entry_for_material(mat, "gemstone"),
+        }
     is_hair = master_preset == "hair"
     hair_bridge_contract = _hair_bridge_contract(mat) if is_hair else None
     tree_part = tree_part_for_material(mat) if master_preset == "tree" else None
