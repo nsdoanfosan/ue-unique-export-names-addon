@@ -17,6 +17,7 @@ from .utils import (
     clean_token,
     export_collection,
     hair_tool_asset_groups,
+    handoff_object_name,
     validation_scope_objects,
 )
 
@@ -145,7 +146,7 @@ def resolve_asset_unit_name(obj, context=None):
             scope_objects.add(parent)
             parent = parent.parent
     root = get_asset_pivot(obj, collection) or top_empty_parent(obj, scope_objects)
-    return clean_token((root or obj).name)
+    return clean_token(handoff_object_name(root or obj))
 
 
 def _asset_name_from_value(value):
