@@ -17,6 +17,15 @@ def clean_token(value):
     return value or "Asset"
 
 
+def handoff_object_name(obj):
+    """Use the native Hair Tool export identity for its disposable output only."""
+    get = getattr(obj, "get", lambda _key, default=None: default)
+    source_name = get('_send2ue_hair_tool_source_name')
+    if get('_send2ue_hair_tool_temp') and isinstance(source_name, str) and source_name.strip():
+        return source_name
+    return obj.name
+
+
 def asset_prefix(context, prefix_mode, custom_prefix):
     if prefix_mode == "CUSTOM" and custom_prefix.strip():
         return clean_token(custom_prefix)

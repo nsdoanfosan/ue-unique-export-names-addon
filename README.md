@@ -260,3 +260,11 @@ The root must belong to the requested scene; legacy `Baking/low` stays supported
 
 Validate with Blender `--factory-startup --background --python
 tests/blender_scoped_baking_low_smoke.py` (no preference writes).
+
+### Native Hair Tool temporary names
+
+Only disposable outputs carrying both the native Hair Tool temporary marker and
+source-name identity use that identity for asset-unit and JSON sidecar names.
+This keeps a temporary `GuideSim.001` object aligned with its exported `GuideSim`
+asset without renaming the source. Ordinary objects retain their normal naming
+validation. App-free coverage: `tests/test_native_hair_handoff_name.py`.

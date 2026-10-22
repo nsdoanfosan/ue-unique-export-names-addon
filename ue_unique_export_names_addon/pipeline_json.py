@@ -26,7 +26,7 @@ from .unreal_material_json import (
     is_translucent_material,
     master_preset_for_material,
 )
-from .utils import clean_token, export_collection
+from .utils import clean_token, export_collection, handoff_object_name
 from .validation import export_validation_rows
 from .validation import _hair_asset_validation_row
 
@@ -247,7 +247,7 @@ def write_unreal_pipeline_json(
         # Meshes belonging to an Empty asset unit use the Empty JSON even when
         # an Armature or another in-scope object sits between them.
         for obj in standalone_objects:
-            mesh_name = clean_token(obj.name)
+            mesh_name = clean_token(handoff_object_name(obj))
             entries = []
             seen_materials = set()
             for slot_index, mat, _location in unreal_handoff_material_slot_entries(obj):
@@ -275,7 +275,7 @@ def write_unreal_pipeline_json(
 
     # 2) Per Empty asset-unit sidecar. Explicit nested static export pivots own
     # separate units; other hierarchies retain their highest-Empty grouping.
-    standalone_names = {clean_token(obj.name) for obj in standalone_objects}
+    standalone_names = {clean_token(handoff_object_name(obj)) for obj in standalone_objects}
     for empty, unit_objects in asset_unit_groups:
         empty_name = clean_token(empty.name)
         # A genuinely standalone mesh with this name already owns the sidecar.
@@ -364,7 +364,7 @@ def write_unreal_pipeline_json(
 def cleanup_stale_pipeline_sidecars(context, json_dir, objects, keep_paths, hair_assets=None):
     hair_assets = list(hair_assets or [])
     keep = {Path(path).resolve() for path in keep_paths}
-    candidate_names = {clean_token(obj.name) for obj in objects}
+    candidate_names = {clean_token(handoff_object_name(obj)) for obj in objects}
     candidate_names.update(clean_token(asset["asset_name"]) for asset in hair_assets)
     _standalone, asset_unit_groups = _asset_unit_groups(context, objects)
     candidate_names.update(
@@ -386,9 +386,9 @@ def _json_target_names(objects, combined_only=False, hair_assets=None, context=N
     names = []
     standalone_objects, asset_unit_groups = _asset_unit_groups(context, objects)
     if not combined_only:
-        names.extend(obj.name for obj in standalone_objects)
+        names.extend(handoff_object_name(obj) for obj in standalone_objects)
 
-    standalone_names = {clean_token(obj.name) for obj in standalone_objects}
+    standalone_names = {clean_token(handoff_object_name(obj)) for obj in standalone_objects}
     for empty, _unit_objects in asset_unit_groups:
         if clean_token(empty.name) in standalone_names:
             continue
