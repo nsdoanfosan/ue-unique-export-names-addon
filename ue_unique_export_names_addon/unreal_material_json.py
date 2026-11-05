@@ -547,6 +547,11 @@ def _texture_json_entry_from_path(param, source_path):
 
 
 def texture_asset_name_for_image(image, source_path=None):
+    alias = str(image.get("unreal_texture_asset_name", "") or "").strip()
+    if alias:
+        if clean_token(alias) != alias or not alias.startswith(TEXTURE_PREFIX):
+            raise ValueError(f"Invalid Unreal texture asset name: {alias!r}")
+        return alias
     source_path = source_path or image_disk_path(image)
     stem = Path(source_path).stem if source_path else image.name
     clean_name = clean_token(stem)
@@ -874,6 +879,12 @@ def _speedtree_material_intent(mat, instance_profile=None):
 
 def _material_json_entry(mat, slot_index, texture_map):
     master_preset = master_preset_for_material(mat)
+    generated_name = str(mat.get("unreal_generated_material_name", "") or "").strip()
+    if generated_name:
+        if master_preset is not None:
+            raise ValueError("Generated material alias is supported only for new prop materials")
+        if clean_token(generated_name) != generated_name or not generated_name.startswith("M_"):
+            raise ValueError(f"Invalid Unreal generated material name: {generated_name!r}")
     if master_preset == "gemstone":
         return {
             "name": mat.name, "slot_name": mat.name, "slot_index": slot_index,
@@ -915,7 +926,7 @@ def _material_json_entry(mat, slot_index, texture_map):
         for role, image in texture_map.get(mat, {}).items():
             textures.append(_texture_json_entry(role, image))
     entry = {
-        "name": mat.name,
+        "name": generated_name or mat.name,
         "slot_name": mat.name,
         "slot_index": slot_index,
         "translucent": translucent,
